@@ -277,6 +277,8 @@
 pub mod context;
 pub mod fields;
 pub mod filter;
+#[cfg(feature = "fast-telemetry-context")]
+pub mod metrics;
 pub mod schema;
 #[cfg(feature = "serde")]
 pub mod sink;
@@ -289,6 +291,8 @@ pub use eden_logger_macros::{ctx_with_trace, log_debug, log_error, log_info, log
 pub use context::{LogAudience, LogContext};
 pub use fields::{FieldWriter, RequestFields};
 pub use filter::{clear_filter, disable_levels, enable_levels, init_from_env, init_from_value, should_log};
+#[cfg(feature = "fast-telemetry-context")]
+pub use metrics::{LogAudienceMetrics, LogLevelMetrics, LogMetricsSnapshot, log_metrics_snapshot, visit_log_metrics};
 pub use schema::{EdenLog, LogLevel, emit_direct, write_display_direct, write_json_direct};
 #[cfg(feature = "serde")]
 pub use sink::install_sink;

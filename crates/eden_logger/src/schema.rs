@@ -285,6 +285,9 @@ impl<R: RequestFields> EdenLog<R> {
             return;
         }
 
+        #[cfg(feature = "fast-telemetry-context")]
+        crate::metrics::record_emitted(self.level, self.audience);
+
         thread_local! {
             static FMT_BUF: RefCell<String> = RefCell::new(String::with_capacity(1024));
         }
@@ -327,6 +330,9 @@ pub fn emit_direct<R: RequestFields>(
     if !crate::filter::should_log(level) {
         return;
     }
+
+    #[cfg(feature = "fast-telemetry-context")]
+    crate::metrics::record_emitted(level, audience);
 
     thread_local! {
         static FMT_BUF: RefCell<String> = RefCell::new(String::with_capacity(1024));

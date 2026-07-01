@@ -1,6 +1,6 @@
 [package]
 name = "eden_logger"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "High-performance structured logging with compile-time tier gating."
 license = "MIT"
@@ -9,7 +9,7 @@ readme = "README.md"
 
 [dependencies]
 eden_logger_macros = { version = "0.1.0", path = "../eden_logger_macros" }
-fast-telemetry = { version = "0.5.1", optional = true }
+fast-telemetry = { version = "0.7.1", optional = true }
 opentelemetry = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -86,7 +86,7 @@ full = [
 [dev-dependencies]
 criterion = { workspace = true }
 env_logger = { workspace = true }
-fast-telemetry = "0.5.1"
+fast-telemetry = "0.7.1"
 spdlog-rs = "0.4"
 fast_log = "1.7"
 

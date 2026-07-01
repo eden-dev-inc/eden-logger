@@ -56,6 +56,7 @@ Every log has both a **level** (`trace`/`debug`/`info`/`warn`/`error`) and an **
 | `log-client`      | Compile logs with `audience = Client`          |
 | `log-both`        | Compile logs with `audience = Both`            |
 | `source-location` | Include `file!()` / `line!()` in output        |
+| `fast-telemetry-context` | Read trace/span IDs from `fast-telemetry` and expose grouped log counters |
 | `function-name`   | `ctx_with_trace!()` captures the enclosing function name (requires `#[function_name::named]` on the calling function; see [Trace context](#trace-context)) |
 | `serde`           | Enable serde derives on the log types, `EdenLog::to_json`, and the optional `install_sink` registry. Off by default. When off, `RequestFields` impls don't need `Serialize`/`Deserialize` bounds. |
 
@@ -149,6 +150,28 @@ set_trace_source(TraceSource::Otel);   // default is FastTelemetry
 Either source can also be selected through [`WriterConfig::trace_source`] when calling [`init`].
 
 Both are off by default; with neither enabled, `trace_id`/`span_id` simply stay `None`.
+
+## Logger metrics
+
+With `fast-telemetry-context` enabled, every log that passes runtime filtering updates a grouped `fast_telemetry::CounterSet`. Disabled-by-feature logs still compile away, and runtime-filtered logs are not counted.
+
+```rust
+use eden_logger::{log_metrics_snapshot, visit_log_metrics};
+
+let snapshot = log_metrics_snapshot();
+println!("emitted logs: {}", snapshot.emitted_total);
+
+// Or expose cumulative counters through fast-telemetry's MetricVisitor API.
+visit_log_metrics(&mut my_visitor);
+```
+
+The exported series are:
+
+| Metric | Labels |
+|--------|--------|
+| `eden_logger.logs_emitted_total` | none |
+| `eden_logger.logs_emitted_by_level_total` | `level=trace/debug/info/warn/error` |
+| `eden_logger.logs_emitted_by_audience_total` | `audience=internal/client/both` |
 
 ### `ctx_with_trace!()` and the `function-name` feature
 
@@ -302,6 +325,7 @@ There is no buffering layer between the formatter and the sink; bytes go in a si
 | `fields`    | `RequestFields`, `FieldWriter`                                     |
 | `schema`    | `EdenLog<R>`, `emit_direct`, display/JSON writers                  |
 | `filter`    | Runtime level filter (`EDEN_LOG_LEVEL`)                            |
+| `metrics`   | fast-telemetry grouped counters for emitted logs                    |
 | `trace`     | Pluggable `TraceSource` (fast-telemetry / OpenTelemetry)           |
 | `writer`    | Output target (stderr/stdout/sink), format selection               |
 | `sink`      | Optional secondary sink for telemetry export                       |
