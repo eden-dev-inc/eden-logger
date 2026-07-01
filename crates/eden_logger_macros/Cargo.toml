@@ -1,0 +1,51 @@
+[package]
+name = "eden_logger_macros"
+version = "0.1.0"
+edition = "2024"
+description = "Proc macros for eden_logger compile-time logging gates."
+license = "MIT"
+repository = "https://github.com/eden-dev-inc/eden-logger"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }
+
+[features]
+# Log level features
+log-trace = []
+log-debug = []
+log-info = []
+log-warn = []
+log-error = []
+
+# Log audience features
+log-client = []
+log-internal = []
+log-both = []
+
+# Source location feature (adds file:line to logs)
+source-location = []
+
+# When enabled, ctx_with_trace!() expands to a call that captures the
+# enclosing function name via the `function_name!()` macro. This requires
+# the user to annotate the function with `#[function_name::named]`. Off by
+# default — when disabled, ctx_with_trace!() omits the function name.
+function-name = []
+
+# Full logging for development
+full = [
+  "log-trace",
+  "log-debug",
+  "log-info",
+  "log-warn",
+  "log-error",
+  "log-client",
+  "log-internal",
+  "log-both",
+  "source-location",
+  "function-name",
+]

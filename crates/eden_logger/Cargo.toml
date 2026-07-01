@@ -1,0 +1,116 @@
+[package]
+name = "eden_logger"
+version = "0.1.0"
+edition = "2024"
+description = "High-performance structured logging with compile-time tier gating."
+license = "MIT"
+repository = "https://github.com/eden-dev-inc/eden-logger"
+readme = "README.md"
+
+[dependencies]
+eden_logger_macros = { version = "0.1.0", path = "../eden_logger_macros" }
+fast-telemetry = { version = "0.5.1", optional = true }
+opentelemetry = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+log = { workspace = true }
+chrono = { workspace = true }
+smol_str = { workspace = true }
+function_name = { workspace = true, optional = true }
+itoa = { workspace = true }
+ufmt = { workspace = true }
+
+[features]
+# Log level features (forwarded to macro crate)
+log-trace = ["eden_logger_macros/log-trace"]
+log-debug = ["eden_logger_macros/log-debug"]
+log-info = ["eden_logger_macros/log-info"]
+log-warn = ["eden_logger_macros/log-warn"]
+log-error = ["eden_logger_macros/log-error"]
+
+# Log audience features (forwarded to macro crate)
+log-client = ["eden_logger_macros/log-client"]
+log-internal = ["eden_logger_macros/log-internal"]
+log-both = ["eden_logger_macros/log-both"]
+
+# Source location feature (forwarded to macro crate)
+source-location = ["eden_logger_macros/source-location"]
+
+# Read trace/span IDs from fast-telemetry thread-local (~1ns Cell read)
+fast-telemetry-context = ["dep:fast-telemetry"]
+
+# Read trace/span IDs from the current opentelemetry::Context
+otel-context = ["dep:opentelemetry"]
+
+# When enabled, ctx_with_trace!() captures the enclosing function name via
+# the `function_name` crate. Callers that use `ctx_with_trace!()` must then
+# annotate their function with `#[function_name::named]`. When disabled, the
+# macro skips function-name capture and `#[named]` is not required.
+function-name = ["dep:function_name", "eden_logger_macros/function-name"]
+
+# Enable serde derives on the log types, the `EdenLog::to_json` method, and
+# the optional `install_sink` registry. When off, `eden_logger` has no serde
+# dependency and consumers' `RequestFields` impls don't need `Serialize` /
+# `Deserialize` bounds.
+serde = ["dep:serde", "dep:serde_json"]
+
+# Production: info/warn/error only (no debug or trace)
+production = [
+  "log-info",
+  "log-warn",
+  "log-error",
+  "log-internal",
+  "log-client",
+  "log-both",
+  "fast-telemetry-context",
+  "function-name",
+  "serde",
+]
+
+# Full logging for development
+full = [
+  "log-trace",
+  "log-debug",
+  "log-info",
+  "log-warn",
+  "log-error",
+  "log-client",
+  "log-internal",
+  "log-both",
+  "source-location",
+  "fast-telemetry-context",
+  "function-name",
+  "serde",
+]
+
+[dev-dependencies]
+criterion = { workspace = true }
+env_logger = { workspace = true }
+fast-telemetry = "0.5.1"
+spdlog-rs = "0.4"
+fast_log = "1.7"
+
+[[example]]
+name = "logging_example"
+required-features = ["full"]
+
+[[example]]
+name = "profile_hotpath"
+required-features = ["full"]
+
+[[bench]]
+name = "eden_logger"
+harness = false
+required-features = ["full"]
+
+[[bench]]
+name = "logging_comparison"
+harness = false
+required-features = ["full"]
+
+[[bench]]
+name = "display_format"
+harness = false
+
+[lints]
+workspace = true
