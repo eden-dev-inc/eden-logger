@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  FAST_TELEMETRY_PATCH: patch.crates-io.fast-telemetry.path="${{ github.workspace }}/.ci/fast-telemetry/crates/fast-telemetry"
+  FAST_TELEMETRY_EXPORT_PATCH: patch.crates-io.fast-telemetry-export.path="${{ github.workspace }}/.ci/fast-telemetry/crates/fast-telemetry-export"
+
+jobs:
+  quality:
+    name: Test, lint, and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: eden-dev-inc/fast-telemetry
+          ref: dt/otlp-log-export
+          path: .ci/fast-telemetry
+      - uses: dtolnay/rust-toolchain@1.93
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --all-features --config "$FAST_TELEMETRY_PATCH" --config "$FAST_TELEMETRY_EXPORT_PATCH"
+      - run: cargo clippy --workspace --all-targets --all-features --config "$FAST_TELEMETRY_PATCH" --config "$FAST_TELEMETRY_EXPORT_PATCH" -- -D warnings
+      - run: cargo doc --workspace --all-features --no-deps --config "$FAST_TELEMETRY_PATCH" --config "$FAST_TELEMETRY_EXPORT_PATCH"
+        env:
+          RUSTDOCFLAGS: -Dwarnings

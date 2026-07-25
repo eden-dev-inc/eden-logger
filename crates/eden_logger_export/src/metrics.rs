@@ -79,26 +79,44 @@ fn load(value: &AtomicU64) -> u64 {
 /// Cumulative counters and current gauges for one exporter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExporterMetricsSnapshot {
+    /// Records accepted into normal or reserved memory queues.
     pub accepted: u64,
+    /// Records excluded by severity or audience filters.
     pub filtered: u64,
+    /// Records dropped because applicable queues were full.
     pub dropped_queue_full: u64,
+    /// Records submitted after acceptance stopped.
     pub dropped_stopped: u64,
+    /// Individual records larger than the configured encoded batch limit.
     pub dropped_oversize: u64,
+    /// Records abandoned when bounded shutdown ended.
     pub dropped_shutdown: u64,
+    /// Records acknowledged by the collector.
     pub exported: u64,
+    /// Individually isolated records rejected as invalid.
     pub rejected: u64,
+    /// OTLP requests attempted.
     pub export_attempts: u64,
+    /// Transient request retries.
     pub retries: u64,
+    /// OTLP partial-success responses received.
     pub partial_rejections: u64,
+    /// Batches fully acknowledged by the collector.
     pub batches: u64,
+    /// Records currently held in the normal queue.
     pub normal_queue_depth: u64,
+    /// Records currently held in the reserved queue.
     pub reserved_queue_depth: u64,
+    /// Records currently owned by the worker's active batch.
     pub inflight: u64,
+    /// Registered thread-local producer lanes.
     pub producer_lanes: u64,
+    /// Current exporter lifecycle state.
     pub status: ExporterStatus,
 }
 
 impl ExporterMetricsSnapshot {
+    /// Sum every record-drop reason in this snapshot.
     pub const fn dropped_total(&self) -> u64 {
         self.dropped_queue_full
             .saturating_add(self.dropped_stopped)

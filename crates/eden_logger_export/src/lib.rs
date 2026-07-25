@@ -41,8 +41,11 @@ const DEFAULT_RESERVED_CAPACITY: usize = 4_096;
 /// Audience selection applied independently from eden_logger's runtime filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudienceFilter {
+    /// Accept records whose audience is internal.
     pub internal: bool,
+    /// Accept records whose audience is client-facing.
     pub client: bool,
+    /// Accept records explicitly marked for both audiences.
     pub both: bool,
 }
 
@@ -69,24 +72,40 @@ impl Default for AudienceFilter {
 /// Direct exporter configuration.
 #[derive(Clone)]
 pub struct ExporterConfig {
+    /// Shared OTLP/HTTP endpoint, timeout, headers, compression, and TLS options.
     pub http: OtlpHttpConfig,
+    /// OTLP `service.name` resource attribute.
     pub service_name: String,
+    /// OTLP instrumentation scope name.
     pub scope_name: String,
+    /// Additional OTLP resource attributes.
     pub resource_attributes: Vec<(String, String)>,
+    /// Lowest severity accepted by the exporter.
     pub min_level: LogLevel,
+    /// Accepted Eden audiences.
     pub audiences: AudienceFilter,
+    /// Severity that may fall back to reserved queue capacity.
     pub priority_threshold: LogLevel,
+    /// Global capacity available to all accepted severities.
     pub normal_queue_capacity: usize,
+    /// Additional global capacity available at or above `priority_threshold`.
     pub reserved_queue_capacity: usize,
+    /// Maximum records in one OTLP request.
     pub max_batch_records: usize,
+    /// Maximum encoded bytes in one OTLP request.
     pub max_batch_bytes: usize,
+    /// Maximum time to wait before flushing a non-empty batch.
     pub max_batch_delay: Duration,
+    /// Initial transient retry delay before jitter.
     pub retry_initial: Duration,
+    /// Maximum transient retry delay before jitter.
     pub retry_max: Duration,
+    /// Minimum interval between aggregate emergency stderr diagnostics.
     pub diagnostic_interval: Duration,
 }
 
 impl ExporterConfig {
+    /// Create a configuration using production defaults.
     pub fn new(endpoint: impl Into<String>, service_name: impl Into<String>) -> Self {
         Self {
             http: OtlpHttpConfig::new(endpoint),
@@ -107,52 +126,62 @@ impl ExporterConfig {
         }
     }
 
+    /// Override the OTLP instrumentation scope name.
     pub fn with_scope_name(mut self, scope_name: impl Into<String>) -> Self {
         self.scope_name = scope_name.into();
         self
     }
 
+    /// Add one OTLP resource attribute.
     pub fn with_resource_attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.resource_attributes.push((key.into(), value.into()));
         self
     }
 
+    /// Add one HTTP header to every request.
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.http = self.http.with_header(name, value);
         self
     }
 
+    /// Set the per-request timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.http = self.http.with_timeout(timeout);
         self
     }
 
+    /// Add a PEM-encoded CA certificate bundle.
     pub fn with_ca_certificate_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
         self.http = self.http.with_ca_certificate_pem(pem);
         self
     }
 
+    /// Set a PEM client certificate chain and private key for mTLS.
     pub fn with_client_identity_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
         self.http = self.http.with_client_identity_pem(pem);
         self
     }
 
+    /// Set the lowest exported severity.
     pub fn with_min_level(mut self, min_level: LogLevel) -> Self {
         self.min_level = min_level;
         self
     }
 
+    /// Select the Eden audiences accepted by this exporter.
     pub fn with_audiences(mut self, audiences: AudienceFilter) -> Self {
         self.audiences = audiences;
         self
     }
 
+    /// Set normal and reserved global queue capacities.
     pub fn with_queue_capacities(mut self, normal: usize, reserved: usize) -> Self {
         self.normal_queue_capacity = normal;
         self.reserved_queue_capacity = reserved;
         self
     }
 
+    /// Set batch record, encoded-byte, and maximum-delay limits.
     pub fn with_batch_limits(mut self, records: usize, bytes: usize, delay: Duration) -> Self {
         self.max_batch_records = records;
         self.max_batch_bytes = bytes;
@@ -160,6 +189,7 @@ impl ExporterConfig {
         self
     }
 
+    /// Set initial and maximum transient retry delays.
     pub fn with_retry(mut self, initial: Duration, maximum: Duration) -> Self {
         self.retry_initial = initial;
         self.retry_max = maximum;
@@ -184,6 +214,9 @@ impl ExporterConfig {
                 "retry durations must be non-zero and initial must not exceed maximum".to_string(),
             ));
         }
+        if self.diagnostic_interval.is_zero() {
+            return Err(InstallError::InvalidConfig("diagnostic_interval must be greater than zero".to_string()));
+        }
         Ok(())
     }
 }
@@ -193,10 +226,15 @@ impl ExporterConfig {
 #[repr(u8)]
 pub enum ExporterStatus {
     #[default]
+    /// Accepting and exporting records normally.
     Running = 0,
+    /// Waiting before a transient retry.
     BackingOff = 1,
+    /// Stopped on a permanent transport or configuration failure.
     TerminalFailure = 2,
+    /// No longer accepting records and attempting a bounded drain.
     ShuttingDown = 3,
+    /// Worker execution has ended.
     Stopped = 4,
 }
 
@@ -225,9 +263,13 @@ impl ExporterStatus {
 /// Installation failure before a sink is registered.
 #[derive(Debug)]
 pub enum InstallError {
+    /// Installation was attempted outside a Tokio runtime.
     NoTokioRuntime,
+    /// Queue, batch, identity, or retry configuration is invalid.
     InvalidConfig(String),
+    /// The OTLP HTTP client rejected its endpoint, headers, or TLS material.
     Transport(OtlpHttpError),
+    /// A typed Eden sink was already installed for this `RequestFields` type.
     SinkAlreadyInstalled,
 }
 
@@ -285,18 +327,22 @@ pub struct ExporterHandle {
 }
 
 impl ExporterHandle {
+    /// Return the current exporter lifecycle state.
     pub fn status(&self) -> ExporterStatus {
         ExporterStatus::from_u8(self.shared.metrics.status.load(Ordering::Acquire))
     }
 
+    /// Return the latest worker or transport diagnostic.
     pub fn last_error(&self) -> Option<String> {
         self.shared.last_error.lock().ok().and_then(|error| error.clone())
     }
 
+    /// Snapshot cumulative counters and current gauges.
     pub fn metrics_snapshot(&self) -> ExporterMetricsSnapshot {
         self.shared.metrics.snapshot()
     }
 
+    /// Emit the current snapshot through fast-telemetry's native visitor API.
     pub fn visit_metrics<V: fast_telemetry::MetricVisitor + ?Sized>(&self, visitor: &mut V) {
         visit_exporter_metrics(&self.metrics_snapshot(), visitor);
     }
@@ -357,6 +403,9 @@ where
 }
 
 /// Install on an explicitly supplied Tokio runtime.
+///
+/// This is useful when setup occurs outside the runtime thread that will own
+/// the exporter worker.
 pub fn install_on<R>(runtime: &Handle, config: ExporterConfig) -> Result<ExporterHandle, InstallError>
 where
     R: RequestFields,
@@ -441,4 +490,70 @@ fn unix_millis() -> u64 {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_every_bounded_exporter_limit() {
+        let valid = ExporterConfig::new("http://localhost:4318", "checkout");
+        assert!(valid.validate().is_ok());
+
+        let mut cases = Vec::new();
+
+        let mut config = valid.clone();
+        config.service_name.clear();
+        cases.push(config);
+
+        let mut config = valid.clone();
+        config.scope_name.clear();
+        cases.push(config);
+
+        let mut config = valid.clone();
+        config.normal_queue_capacity = 0;
+        cases.push(config);
+
+        let mut config = valid.clone();
+        config.reserved_queue_capacity = 0;
+        cases.push(config);
+
+        let mut config = valid.clone();
+        config.max_batch_records = 0;
+        cases.push(config);
+
+        let mut config = valid.clone();
+        config.max_batch_bytes = 0;
+        cases.push(config);
+
+        let mut config = valid.clone();
+        config.max_batch_delay = Duration::ZERO;
+        cases.push(config);
+
+        let mut config = valid.clone();
+        config.retry_initial = Duration::ZERO;
+        cases.push(config);
+
+        let mut config = valid.clone();
+        config.retry_initial = config.retry_max + Duration::from_millis(1);
+        cases.push(config);
+
+        let mut config = valid;
+        config.diagnostic_interval = Duration::ZERO;
+        cases.push(config);
+
+        for config in cases {
+            assert!(matches!(config.validate(), Err(InstallError::InvalidConfig(_))));
+        }
+    }
+
+    #[test]
+    fn audience_filter_keeps_each_audience_independent() {
+        let filter = AudienceFilter { internal: true, client: false, both: true };
+
+        assert!(filter.allows(LogAudience::Internal));
+        assert!(!filter.allows(LogAudience::Client));
+        assert!(filter.allows(LogAudience::Both));
+    }
 }

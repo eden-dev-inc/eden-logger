@@ -15,8 +15,11 @@ use crate::{EdenLogOtlpMapper, ExporterConfig, ExporterMetricsSnapshot, Exporter
 /// Result of a bounded exporter shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShutdownReport {
+    /// Whether the shutdown deadline elapsed before the worker drained.
     pub timed_out: bool,
+    /// Records that remained when shutdown ended.
     pub remaining_records: u64,
+    /// Final exporter metric snapshot.
     pub metrics: ExporterMetricsSnapshot,
 }
 

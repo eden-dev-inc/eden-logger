@@ -2,6 +2,7 @@
 name = "eden_logger"
 version = "0.1.2"
 edition = "2024"
+rust-version.workspace = true
 description = "High-performance structured logging with compile-time tier gating."
 license = "MIT"
 repository = "https://github.com/eden-dev-inc/eden-logger"

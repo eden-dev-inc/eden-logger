@@ -4,6 +4,12 @@
 exports accepted records to any OTLP/HTTP protobuf endpoint, including the
 OpenTelemetry Collector.
 
+```toml
+[dependencies]
+eden_logger = { version = "0.1.2", features = ["sink", "log-info", "log-warn", "log-error", "log-internal"] }
+eden_logger_export = "0.1.0"
+```
+
 ```rust,no_run
 use std::time::Duration;
 
@@ -41,6 +47,34 @@ off the application threads.
 Use `LogTarget::StructuredSink` when OTLP is the only output. It skips creation
 of a duplicate display/JSON line while retaining structured sink dispatch.
 
+## Mapping
+
+- Eden message → OTLP body.
+- Eden timestamp → `time_unix_nano`; worker mapping time →
+  `observed_time_unix_nano`.
+- Trace/debug/info/warn/error → OTLP severity numbers 1/5/9/13/17.
+- Valid hexadecimal trace/span IDs → native OTLP IDs; malformed values remain
+  visible as Eden attributes.
+- Audience, feature, function, source location, errors, request fields, and
+  additional fields → OTLP attributes.
+- `service.name` and configured identity fields → OTLP resource attributes.
+- Scope name defaults to `eden_logger`.
+
+Intrinsic Eden attributes win key collisions, followed by typed request fields,
+then additional string fields. `EdenLogOtlpMapper::map_with_attributes` lets an
+ordered intermediary add stable event, stream, epoch, or sequence attributes.
+
+## Configuration and security
+
+`ExporterConfig` exposes severity/audience filtering, priority threshold,
+normal and reserved capacities, batch count/bytes/delay, request timeout, retry
+bounds, resource identity, scope name, and diagnostic interval. Its embedded
+`OtlpHttpConfig` also supports a gzip threshold, custom headers, additional CA
+bundles, and a PEM client certificate/private-key identity for mTLS.
+
+Invalid endpoints, headers, CA bundles, identities, and batch/queue/retry
+settings fail during installation before a sink is registered.
+
 The direct exporter is intentionally best-effort:
 
 - Normal capacity is 61,440 records, with 4,096 reserved slots available to
@@ -53,6 +87,25 @@ The direct exporter is intentionally best-effort:
 
 Use shard-stream when logs require HA replication, bounded disk spooling, or
 per-stream ordering before OTLP delivery.
+
+## Health and metrics
+
+`ExporterHandle::status` reports running, backing off, terminal failure,
+shutting down, or stopped. `last_error` provides the latest diagnostic without
+recursively entering Eden logging. `metrics_snapshot` exposes queue, drop,
+attempt, retry, rejection, batch, inflight, lane, and lifecycle values.
+`visit_metrics` emits the same snapshot through
+`fast_telemetry::MetricVisitor`.
+
+Authentication failures and permanent configuration/status failures stop
+progress and set terminal health. Transient transport errors, 408, 425, 429,
+and 5xx responses retry with jitter and honor `Retry-After`. HTTP 400/413 and
+partial-success responses are bisected until an invalid individual record can
+be rejected without blocking later records.
+
+`shutdown(deadline)` first stops acceptance, then attempts a bounded drain. Its
+`ShutdownReport` states whether the deadline elapsed and how many records were
+left or counted as shutdown drops.
 
 The eight-thread contention benchmark is in `benches/sink_enqueue.rs`; its
 recorded before/after results are in `benches/THREAD_LOCAL_RESULTS.md`.

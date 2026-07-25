@@ -11,11 +11,17 @@ Standalone workspace for Eden's public structured logging crates.
 Eden-specific wrappers, including `eden_logger_internal`, live in `eden-dev` and are not part of this public logger workspace.
 
 The primary crate documentation lives in [`crates/eden_logger/README.md`](crates/eden_logger/README.md).
+Direct OTLP export is documented in
+[`crates/eden_logger_export/README.md`](crates/eden_logger_export/README.md).
+Release changes and dependency order are tracked in
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ## Development
 
 ```bash
 cargo fmt --check
 cargo check --workspace
+cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 ```
