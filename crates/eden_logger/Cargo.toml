@@ -9,6 +9,7 @@ repository = "https://github.com/eden-dev-inc/eden-logger"
 readme = "README.md"
 
 [dependencies]
+arc-swap = { workspace = true, optional = true }
 eden_logger_macros = { version = "0.1.0", path = "../eden_logger_macros" }
 fast-telemetry = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
@@ -50,7 +51,7 @@ otel-context = ["dep:opentelemetry"]
 function-name = ["dep:function_name", "eden_logger_macros/function-name"]
 
 # Enable the optional structured sink registry without requiring serialization.
-sink = []
+sink = ["dep:arc-swap"]
 
 # Enable serde derives and `EdenLog::to_json`. This continues to imply `sink`
 # for compatibility with releases where `install_sink` was gated by `serde`.

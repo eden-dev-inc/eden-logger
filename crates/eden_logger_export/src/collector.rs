@@ -3,8 +3,8 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use eden_logger::{EdenLog, RequestFields};
 use parking_lot::Mutex;
@@ -20,7 +20,7 @@ thread_local! {
     /// The type-erased entries allow applications to install sinks for more
     /// than one RequestFields type while keeping the steady-state lookup and
     /// queue mutation thread-local.
-    static LOCAL_PRODUCERS: RefCell<Vec<(u64, Box<dyn Any>)>> = const { RefCell::new(Vec::new()) };
+    static LOCAL_PRODUCERS: RefCell<Vec<(u64, Box<dyn LocalProducerEntry>)>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,11 +32,14 @@ pub(crate) enum QueueKind {
 pub(crate) struct QueuedLog<R: RequestFields> {
     pub log: EdenLog<R>,
     pub queue: QueueKind,
+    pub bytes: u64,
+    pub ticket: u64,
 }
 
 pub(crate) enum SubmitResult {
     Accepted,
-    Full,
+    RecordCapacity,
+    ByteCapacity,
 }
 
 pub(crate) trait CollectorControl: Send + Sync {
@@ -44,8 +47,8 @@ pub(crate) trait CollectorControl: Send + Sync {
 }
 
 struct LaneQueues<R: RequestFields> {
-    normal: VecDeque<EdenLog<R>>,
-    reserved: VecDeque<EdenLog<R>>,
+    normal: VecDeque<QueuedLog<R>>,
+    reserved: VecDeque<QueuedLog<R>>,
 }
 
 impl<R: RequestFields> LaneQueues<R> {
@@ -73,10 +76,10 @@ impl<R: RequestFields> ProducerLane<R> {
         }
     }
 
-    fn push(&self, log: EdenLog<R>, queue: QueueKind) -> bool {
+    fn push(&self, log: QueuedLog<R>) -> bool {
         let mut queues = self.queues.lock();
         let was_empty = queues.is_empty();
-        match queue {
+        match log.queue {
             QueueKind::Normal => queues.normal.push_back(log),
             QueueKind::Reserved => queues.reserved.push_back(log),
         }
@@ -107,14 +110,34 @@ impl<R: RequestFields> ProducerLane<R> {
 }
 
 struct LocalProducer<R: RequestFields> {
-    lane: Arc<ProducerLane<R>>,
-    shared: Arc<Shared>,
+    lane: Weak<ProducerLane<R>>,
+    pointer: *const ProducerLane<R>,
+    shared: Weak<Shared>,
+}
+
+trait LocalProducerEntry: Any {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn is_alive(&self) -> bool;
+}
+
+impl<R: RequestFields> LocalProducerEntry for LocalProducer<R> {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn is_alive(&self) -> bool {
+        self.lane.strong_count() != 0
+    }
 }
 
 impl<R: RequestFields> Drop for LocalProducer<R> {
     fn drop(&mut self) {
-        self.lane.closed.store(true, Ordering::Release);
-        self.shared.records.notify_one();
+        if let Some(lane) = self.lane.upgrade() {
+            lane.closed.store(true, Ordering::Release);
+        }
+        if let Some(shared) = self.shared.upgrade() {
+            shared.records.notify_one();
+        }
     }
 }
 
@@ -128,16 +151,26 @@ pub(crate) struct LogCollector<R: RequestFields> {
     id: u64,
     normal_capacity: u64,
     reserved_capacity: u64,
+    normal_byte_capacity: u64,
+    reserved_byte_capacity: u64,
     lanes: Mutex<LaneRegistry<R>>,
     shared: Arc<Shared>,
 }
 
 impl<R: RequestFields> LogCollector<R> {
-    pub fn new(normal_capacity: usize, reserved_capacity: usize, shared: Arc<Shared>) -> Arc<Self> {
+    pub fn new(
+        normal_capacity: usize,
+        reserved_capacity: usize,
+        normal_byte_capacity: usize,
+        reserved_byte_capacity: usize,
+        shared: Arc<Shared>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id: NEXT_COLLECTOR_ID.fetch_add(1, Ordering::Relaxed),
             normal_capacity: normal_capacity.try_into().unwrap_or(u64::MAX),
             reserved_capacity: reserved_capacity.try_into().unwrap_or(u64::MAX),
+            normal_byte_capacity: normal_byte_capacity.try_into().unwrap_or(u64::MAX),
+            reserved_byte_capacity: reserved_byte_capacity.try_into().unwrap_or(u64::MAX),
             lanes: Mutex::new(LaneRegistry { lanes: Vec::new(), cursor: 0 }),
             shared,
         })
@@ -147,14 +180,33 @@ impl<R: RequestFields> LogCollector<R> {
     #[inline]
     pub fn submit(self: &Arc<Self>, log: EdenLog<R>, priority: bool) -> SubmitResult {
         LOCAL_PRODUCERS.with_borrow_mut(|entries| {
-            let position = entries.iter().position(|(id, _)| *id == self.id).unwrap_or_else(|| {
-                let lane = self.register_lane();
-                entries.push((self.id, Box::new(LocalProducer::<R> { lane, shared: Arc::clone(&self.shared) })));
-                entries.len() - 1
+            let pointer = entries.iter_mut().find(|(id, _)| *id == self.id).map(|(_, producer)| {
+                producer
+                    .as_any_mut()
+                    .downcast_mut::<LocalProducer<R>>()
+                    .expect("collector IDs are unique across RequestFields types")
+                    .pointer
             });
-            let producer =
-                entries[position].1.downcast_mut::<LocalProducer<R>>().expect("collector IDs are unique across RequestFields types");
-            self.submit_to_lane(&producer.lane, log, priority)
+            let pointer = pointer.unwrap_or_else(|| {
+                // Reconfiguration gives each collector a fresh ID. Retire
+                // expired weak entries only on that cold path.
+                entries.retain(|(_, producer)| producer.is_alive());
+                let lane = self.register_lane();
+                let pointer = Arc::as_ptr(&lane);
+                entries.push((
+                    self.id,
+                    Box::new(LocalProducer::<R> {
+                        lane: Arc::downgrade(&lane),
+                        pointer,
+                        shared: Arc::downgrade(&self.shared),
+                    }),
+                ));
+                pointer
+            });
+            // SAFETY: collector IDs are unique and this callback owns `self`,
+            // whose registry owns every registered lane. A lane can be cleared
+            // only after acceptance stops and active submissions reach zero.
+            self.submit_to_lane(unsafe { &*pointer }, log, priority)
         })
     }
 
@@ -166,15 +218,36 @@ impl<R: RequestFields> LogCollector<R> {
     }
 
     fn submit_to_lane(&self, lane: &ProducerLane<R>, log: EdenLog<R>, priority: bool) -> SubmitResult {
-        let (queue, log) = if claim(&self.shared.metrics.normal_queue_depth, self.normal_capacity) {
-            (QueueKind::Normal, log)
-        } else if priority && claim(&self.shared.metrics.reserved_queue_depth, self.reserved_capacity) {
-            (QueueKind::Reserved, log)
-        } else {
-            return SubmitResult::Full;
+        let bytes = log.estimated_size_bytes().try_into().unwrap_or(u64::MAX);
+        let normal = claim_queue(
+            &self.shared.metrics.normal_queue_depth,
+            self.normal_capacity,
+            &self.shared.metrics.normal_queue_bytes,
+            self.normal_byte_capacity,
+            bytes,
+        );
+        let (queue, failure) = match normal {
+            Ok(()) => (QueueKind::Normal, None),
+            Err(normal_failure) if priority => {
+                match claim_queue(
+                    &self.shared.metrics.reserved_queue_depth,
+                    self.reserved_capacity,
+                    &self.shared.metrics.reserved_queue_bytes,
+                    self.reserved_byte_capacity,
+                    bytes,
+                ) {
+                    Ok(()) => (QueueKind::Reserved, None),
+                    Err(reserved_failure) => (QueueKind::Reserved, Some(normal_failure.combine(reserved_failure))),
+                }
+            }
+            Err(failure) => (QueueKind::Normal, Some(failure)),
         };
+        if let Some(failure) = failure {
+            return failure.submit_result();
+        }
 
-        if lane.push(log, queue) {
+        let ticket = self.shared.next_ticket.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        if lane.push(QueuedLog { log, queue, bytes, ticket }) {
             self.shared.records.notify_one();
         }
         SubmitResult::Accepted
@@ -218,10 +291,16 @@ impl<R: RequestFields> LogCollector<R> {
     }
 
     /// Release one global capacity slot after the worker takes ownership.
-    pub fn release(&self, queue: QueueKind) {
+    pub fn release(&self, queue: QueueKind, bytes: u64) {
         match queue {
-            QueueKind::Normal => decrement(&self.shared.metrics.normal_queue_depth),
-            QueueKind::Reserved => decrement(&self.shared.metrics.reserved_queue_depth),
+            QueueKind::Normal => {
+                decrement(&self.shared.metrics.normal_queue_depth);
+                subtract(&self.shared.metrics.normal_queue_bytes, bytes);
+            }
+            QueueKind::Reserved => {
+                decrement(&self.shared.metrics.reserved_queue_depth);
+                subtract(&self.shared.metrics.reserved_queue_bytes, bytes);
+            }
         }
     }
 
@@ -246,17 +325,69 @@ impl<R: RequestFields> CollectorControl for LogCollector<R> {
         registry.lanes.clear();
         registry.cursor = 0;
         self.shared.metrics.producer_lanes.store(0, Ordering::Relaxed);
+        self.shared.metrics.normal_queue_depth.store(0, Ordering::Relaxed);
+        self.shared.metrics.reserved_queue_depth.store(0, Ordering::Relaxed);
+        self.shared.metrics.normal_queue_bytes.store(0, Ordering::Relaxed);
+        self.shared.metrics.reserved_queue_bytes.store(0, Ordering::Relaxed);
     }
 }
 
-fn claim(depth: &AtomicU64, capacity: u64) -> bool {
-    let previous = depth.fetch_add(1, Ordering::AcqRel);
-    if previous < capacity {
+#[derive(Clone, Copy)]
+enum ClaimFailure {
+    Records,
+    Bytes,
+}
+
+impl ClaimFailure {
+    fn combine(self, other: Self) -> Self {
+        if matches!(self, Self::Bytes) || matches!(other, Self::Bytes) {
+            Self::Bytes
+        } else {
+            Self::Records
+        }
+    }
+
+    fn submit_result(self) -> SubmitResult {
+        match self {
+            Self::Records => SubmitResult::RecordCapacity,
+            Self::Bytes => SubmitResult::ByteCapacity,
+        }
+    }
+}
+
+fn claim_queue(depth: &AtomicU64, capacity: u64, byte_depth: &AtomicU64, byte_capacity: u64, bytes: u64) -> Result<(), ClaimFailure> {
+    if !claim_amount(byte_depth, byte_capacity, bytes) {
+        return Err(ClaimFailure::Bytes);
+    }
+    if !claim_amount(depth, capacity, 1) {
+        subtract(byte_depth, bytes);
+        return Err(ClaimFailure::Records);
+    }
+    Ok(())
+}
+
+fn claim_amount(depth: &AtomicU64, capacity: u64, amount: u64) -> bool {
+    if amount > capacity {
+        return false;
+    }
+    if capacity > u64::MAX / 2 {
+        return depth
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                current.checked_add(amount).filter(|next| *next <= capacity)
+            })
+            .is_ok();
+    }
+    let previous = depth.fetch_add(amount, Ordering::AcqRel);
+    if previous <= capacity - amount {
         true
     } else {
-        depth.fetch_sub(1, Ordering::Release);
+        depth.fetch_sub(amount, Ordering::Release);
         false
     }
+}
+
+fn subtract(depth: &AtomicU64, amount: u64) {
+    let _ = depth.fetch_update(Ordering::Release, Ordering::Relaxed, |current| Some(current.saturating_sub(amount)));
 }
 
 fn drain_batches<R: RequestFields>(batches: &mut [LaneQueues<R>], queue: QueueKind, output: &mut VecDeque<QueuedLog<R>>) {
@@ -269,7 +400,7 @@ fn drain_batches<R: RequestFields>(batches: &mut [LaneQueues<R>], queue: QueueKi
             };
             let take = DRAIN_QUANTUM.min(source.len());
             drained += take;
-            output.extend(source.drain(..take).map(|log| QueuedLog { log, queue }));
+            output.extend(source.drain(..take));
         }
         if drained == 0 {
             return;
@@ -302,9 +433,14 @@ mod tests {
     fn shared() -> Arc<Shared> {
         Arc::new(Shared {
             accepting: AtomicBool::new(true),
+            active_submissions: AtomicU64::new(0),
+            next_ticket: AtomicU64::new(0),
+            completed_ticket: AtomicU64::new(0),
             metrics: ExporterMetrics::default(),
             shutdown: Notify::new(),
             records: Notify::new(),
+            flush: Notify::new(),
+            progress: Notify::new(),
             diagnostic_interval_millis: Duration::from_secs(60).as_millis() as u64,
             last_diagnostic_millis: AtomicU64::new(0),
             last_error: std::sync::Mutex::new(None),
@@ -315,11 +451,16 @@ mod tests {
         EdenLog::new(LogLevel::Info, message, &LogContext::<TestFields>::new(), LogAudience::Internal)
     }
 
+    fn queued(message: &str, queue: QueueKind, ticket: u64) -> QueuedLog<TestFields> {
+        let log = log(message);
+        QueuedLog { bytes: log.estimated_size_bytes() as u64, log, queue, ticket }
+    }
+
     #[test]
     fn recycles_queue_allocations_between_worker_drains() {
         let lane = ProducerLane::new();
-        for _ in 0..128 {
-            lane.push(log("buffered"), QueueKind::Normal);
+        for ticket in 1..=128 {
+            lane.push(queued("buffered", QueueKind::Normal, ticket));
         }
 
         let mut drained = lane.take();
@@ -328,7 +469,7 @@ mod tests {
         drained.normal.clear();
         lane.recycle(drained);
 
-        lane.push(log("next"), QueueKind::Normal);
+        lane.push(queued("next", QueueKind::Normal, 129));
         let mut next = lane.take();
         assert_eq!(next.normal.len(), 1);
         next.normal.clear();
@@ -340,7 +481,7 @@ mod tests {
     #[test]
     fn registers_one_lane_per_thread_and_drains_all_records() {
         let shared = shared();
-        let collector = LogCollector::new(8, 2, Arc::clone(&shared));
+        let collector = LogCollector::new(8, 2, 1024 * 1024, 1024 * 1024, Arc::clone(&shared));
         assert!(matches!(collector.submit(log("main-1"), false), SubmitResult::Accepted));
         assert!(matches!(collector.submit(log("main-2"), false), SubmitResult::Accepted));
         assert_eq!(collector.registered_lanes(), 1);
@@ -358,7 +499,7 @@ mod tests {
         let mut normal = VecDeque::new();
         assert_eq!(collector.drain_into(&mut reserved, &mut normal), 3);
         while let Some(record) = reserved.pop_front().or_else(|| normal.pop_front()) {
-            collector.release(record.queue);
+            collector.release(record.queue, record.bytes);
         }
         assert_eq!(shared.metrics.normal_queue_depth.load(Ordering::Relaxed), 0);
 
@@ -370,12 +511,12 @@ mod tests {
     #[test]
     fn enforces_global_normal_and_reserved_capacity() {
         let shared = shared();
-        let collector = LogCollector::new(1, 1, Arc::clone(&shared));
+        let collector = LogCollector::new(1, 1, 1024 * 1024, 1024 * 1024, Arc::clone(&shared));
 
         assert!(matches!(collector.submit(log("normal"), false), SubmitResult::Accepted));
-        assert!(matches!(collector.submit(log("normal-full"), false), SubmitResult::Full));
+        assert!(matches!(collector.submit(log("normal-full"), false), SubmitResult::RecordCapacity));
         assert!(matches!(collector.submit(log("reserved"), true), SubmitResult::Accepted));
-        assert!(matches!(collector.submit(log("reserved-full"), true), SubmitResult::Full));
+        assert!(matches!(collector.submit(log("reserved-full"), true), SubmitResult::RecordCapacity));
         assert_eq!(shared.metrics.normal_queue_depth.load(Ordering::Relaxed), 1);
         assert_eq!(shared.metrics.reserved_queue_depth.load(Ordering::Relaxed), 1);
 
@@ -384,10 +525,30 @@ mod tests {
         collector.drain_into(&mut reserved, &mut normal);
         assert_eq!(reserved.front().map(|record| record.queue), Some(QueueKind::Reserved));
         while let Some(record) = reserved.pop_front().or_else(|| normal.pop_front()) {
-            collector.release(record.queue);
+            collector.release(record.queue, record.bytes);
         }
         assert_eq!(shared.metrics.normal_queue_depth.load(Ordering::Relaxed), 0);
         assert_eq!(shared.metrics.reserved_queue_depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn enforces_retained_byte_budgets_independently_from_record_capacity() {
+        let shared = shared();
+        let one = log("one retained record");
+        let bytes = one.estimated_size_bytes();
+        let collector = LogCollector::new(8, 8, bytes, bytes, Arc::clone(&shared));
+
+        assert!(matches!(collector.submit(one, false), SubmitResult::Accepted));
+        assert!(matches!(collector.submit(log("second retained record"), false), SubmitResult::ByteCapacity));
+        assert_eq!(shared.metrics.normal_queue_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.metrics.normal_queue_bytes.load(Ordering::Relaxed), bytes as u64);
+
+        let mut reserved = VecDeque::new();
+        let mut normal = VecDeque::new();
+        collector.drain_into(&mut reserved, &mut normal);
+        let record = normal.pop_front().expect("admitted normal record");
+        collector.release(record.queue, record.bytes);
+        assert_eq!(shared.metrics.normal_queue_bytes.load(Ordering::Relaxed), 0);
     }
 
     #[hegel::test(test_cases = 300)]
@@ -396,7 +557,7 @@ mod tests {
         let reserved_capacity = tc.draw(gs::integers::<u8>().max_value(16)) as usize;
         let priorities = tc.draw(gs::vecs(gs::booleans()).max_size(128));
         let shared = shared();
-        let collector = LogCollector::new(normal_capacity, reserved_capacity, Arc::clone(&shared));
+        let collector = LogCollector::new(normal_capacity, reserved_capacity, 1024 * 1024, 1024 * 1024, Arc::clone(&shared));
         let lane = collector.register_lane();
         let mut expected_normal = Vec::new();
         let mut expected_reserved = Vec::new();
@@ -429,7 +590,7 @@ mod tests {
         assert!(normal.iter().all(|record| record.queue == QueueKind::Normal));
 
         while let Some(record) = reserved.pop_front().or_else(|| normal.pop_front()) {
-            collector.release(record.queue);
+            collector.release(record.queue, record.bytes);
         }
         assert_eq!(shared.metrics.normal_queue_depth.load(Ordering::Relaxed), 0);
         assert_eq!(shared.metrics.reserved_queue_depth.load(Ordering::Relaxed), 0);

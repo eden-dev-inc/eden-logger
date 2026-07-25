@@ -1,9 +1,9 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
-use eden_logger::{EdenLog, RequestFields};
+use eden_logger::RequestFields;
 use fast_telemetry::otlp::{build_log_export_request, pb};
 use fast_telemetry_export::otlp::{OtlpHttpClient, OtlpHttpError};
 use prost::Message;
@@ -25,7 +25,44 @@ pub struct ShutdownReport {
 
 enum BatchResult {
     Complete,
-    Terminal(Vec<Vec<pb::LogRecord>>),
+    Terminal(Vec<Vec<MappedLog>>),
+}
+
+struct MappedLog {
+    ticket: u64,
+    record: pb::LogRecord,
+}
+
+struct CompletionTracker {
+    watermark: u64,
+    out_of_order: BTreeSet<u64>,
+}
+
+impl CompletionTracker {
+    fn new(shared: &Shared) -> Self {
+        Self {
+            watermark: shared.completed_ticket.load(Ordering::Acquire),
+            out_of_order: BTreeSet::new(),
+        }
+    }
+
+    fn complete(&mut self, ticket: u64, shared: &Shared) {
+        if ticket <= self.watermark {
+            return;
+        }
+        self.out_of_order.insert(ticket);
+        while self.out_of_order.remove(&self.watermark.saturating_add(1)) {
+            self.watermark = self.watermark.saturating_add(1);
+        }
+        shared.completed_ticket.store(self.watermark, Ordering::Release);
+        shared.progress.notify_waiters();
+    }
+
+    fn complete_all(&mut self, records: &[MappedLog], shared: &Shared) {
+        for record in records {
+            self.complete(record.ticket, shared);
+        }
+    }
 }
 
 struct WorkerInput<R: RequestFields> {
@@ -70,8 +107,9 @@ where
 {
     let mapper = EdenLogOtlpMapper;
     let request_sizer = ExportRequestSizer::new(&resource, &config.scope_name);
+    let mut completions = CompletionTracker::new(&shared);
     let mut shutting_down = false;
-    let mut pending = VecDeque::<pb::LogRecord>::new();
+    let mut pending = VecDeque::<MappedLog>::new();
     let mut input = WorkerInput::<R>::new();
 
     loop {
@@ -81,10 +119,10 @@ where
         let first = if let Some(record) = pending.pop_front() {
             Some(record)
         } else if shutting_down {
-            try_receive(&collector, &mut input).map(|log| map_log(&mapper, &log))
+            try_receive(&collector, &mut input).map(|log| map_log(&mapper, log))
         } else {
             match receive(&collector, &mut input, &shared).await {
-                Some(log) => Some(map_log(&mapper, &log)),
+                Some(log) => Some(map_log(&mapper, log)),
                 None => {
                     shutting_down = true;
                     None
@@ -95,22 +133,28 @@ where
         let Some(first) = first else {
             if shutting_down {
                 if let Some(log) = try_receive(&collector, &mut input) {
-                    pending.push_back(map_log(&mapper, &log));
+                    pending.push_back(map_log(&mapper, log));
+                    continue;
+                }
+                if shared.active_submissions.load(Ordering::Acquire) != 0 {
+                    shared.records.notified().await;
                     continue;
                 }
                 shared.set_status(ExporterStatus::Stopped);
+                shared.progress.notify_waiters();
                 return ShutdownReport {
                     timed_out: false,
                     remaining_records: 0,
-                    metrics: shared.metrics.snapshot(),
+                    metrics: shared.metrics_snapshot(),
                 };
             }
             continue;
         };
 
-        let first_field_len = length_delimited_field_len(first.encoded_len());
+        let first_field_len = length_delimited_field_len(first.record.encoded_len());
         if request_sizer.encoded_len(first_field_len) > config.max_batch_bytes {
             reject_oversize(&shared);
+            completions.complete(first.ticket, &shared);
             continue;
         }
 
@@ -122,9 +166,9 @@ where
             let next = if let Some(record) = pending.pop_front() {
                 Some(record)
             } else if shutting_down {
-                try_receive(&collector, &mut input).map(|log| map_log(&mapper, &log))
+                try_receive(&collector, &mut input).map(|log| map_log(&mapper, log))
             } else if let Some(log) = try_receive(&collector, &mut input) {
-                Some(map_log(&mapper, &log))
+                Some(map_log(&mapper, log))
             } else {
                 tokio::select! {
                     biased;
@@ -133,8 +177,9 @@ where
                         None
                     }
                     _ = tokio::time::sleep_until(deadline) => None,
+                    _ = shared.flush.notified() => None,
                     _ = shared.records.notified() => {
-                        try_receive(&collector, &mut input).map(|log| map_log(&mapper, &log))
+                        try_receive(&collector, &mut input).map(|log| map_log(&mapper, log))
                     }
                 }
             };
@@ -142,9 +187,10 @@ where
             let Some(record) = next else {
                 break;
             };
-            let record_field_len = length_delimited_field_len(record.encoded_len());
+            let record_field_len = length_delimited_field_len(record.record.encoded_len());
             if request_sizer.encoded_len(record_field_len) > config.max_batch_bytes {
                 reject_oversize(&shared);
+                completions.complete(record.ticket, &shared);
                 continue;
             }
             let candidate_records_len = records_encoded_len.saturating_add(record_field_len);
@@ -157,7 +203,7 @@ where
         }
 
         shared.metrics.inflight.store(batch.len() as u64, Ordering::Relaxed);
-        match export_batch(batch, &client, &resource, &config.scope_name, &config, &shared).await {
+        match export_batch(batch, &client, &resource, &config.scope_name, &config, &shared, &mut completions).await {
             BatchResult::Complete => {
                 shared.metrics.inflight.store(0, Ordering::Relaxed);
                 if shutting_down {
@@ -172,6 +218,9 @@ where
                 if shared.accepting.load(Ordering::Acquire) {
                     shared.shutdown.notified().await;
                 }
+                while shared.active_submissions.load(Ordering::Acquire) != 0 {
+                    shared.records.notified().await;
+                }
                 let queued = shared
                     .metrics
                     .normal_queue_depth
@@ -183,20 +232,26 @@ where
                 input.clear();
                 shared.metrics.normal_queue_depth.store(0, Ordering::Relaxed);
                 shared.metrics.reserved_queue_depth.store(0, Ordering::Relaxed);
+                shared.metrics.normal_queue_bytes.store(0, Ordering::Relaxed);
+                shared.metrics.reserved_queue_bytes.store(0, Ordering::Relaxed);
                 shared.metrics.inflight.store(0, Ordering::Relaxed);
                 shared.set_status(ExporterStatus::Stopped);
+                shared.progress.notify_waiters();
                 return ShutdownReport {
                     timed_out: false,
                     remaining_records: remaining,
-                    metrics: shared.metrics.snapshot(),
+                    metrics: shared.metrics_snapshot(),
                 };
             }
         }
     }
 }
 
-fn map_log<R: RequestFields>(mapper: &EdenLogOtlpMapper, log: &EdenLog<R>) -> pb::LogRecord {
-    mapper.map(log, unix_nanos())
+fn map_log<R: RequestFields>(mapper: &EdenLogOtlpMapper, log: QueuedLog<R>) -> MappedLog {
+    MappedLog {
+        ticket: log.ticket,
+        record: mapper.map(&log.log, unix_nanos()),
+    }
 }
 
 struct ExportRequestSizer {
@@ -233,7 +288,7 @@ fn varint_len(mut value: usize) -> usize {
     encoded_len
 }
 
-async fn receive<R: RequestFields>(collector: &LogCollector<R>, input: &mut WorkerInput<R>, shared: &Shared) -> Option<EdenLog<R>> {
+async fn receive<R: RequestFields>(collector: &LogCollector<R>, input: &mut WorkerInput<R>, shared: &Shared) -> Option<QueuedLog<R>> {
     loop {
         if let Some(log) = try_receive(collector, input) {
             return Some(log);
@@ -246,48 +301,51 @@ async fn receive<R: RequestFields>(collector: &LogCollector<R>, input: &mut Work
     }
 }
 
-fn try_receive<R: RequestFields>(collector: &LogCollector<R>, input: &mut WorkerInput<R>) -> Option<EdenLog<R>> {
+fn try_receive<R: RequestFields>(collector: &LogCollector<R>, input: &mut WorkerInput<R>) -> Option<QueuedLog<R>> {
     if input.is_empty() {
         input.refresh(collector);
     }
     let queued = input.pop_front()?;
-    collector.release(queued.queue);
-    Some(queued.log)
+    collector.release(queued.queue, queued.bytes);
+    Some(queued)
 }
 
 async fn export_batch(
-    batch: Vec<pb::LogRecord>,
+    batch: Vec<MappedLog>,
     client: &OtlpHttpClient,
     resource: &pb::Resource,
     scope_name: &str,
     config: &ExporterConfig,
     shared: &Shared,
+    completions: &mut CompletionTracker,
 ) -> BatchResult {
     let mut pending = vec![batch];
 
     while let Some(records) = pending.pop() {
         let mut failures = 0_u32;
         loop {
-            let request = build_log_export_request(resource, scope_name, records.clone());
+            let request = build_log_export_request(resource, scope_name, records.iter().map(|record| record.record.clone()).collect());
             shared.metrics.export_attempts.fetch_add(1, Ordering::Relaxed);
             match client.export_logs(&request).await {
                 Ok(outcome) if outcome.rejected == 0 => {
                     shared.metrics.exported.fetch_add(records.len() as u64, Ordering::Relaxed);
                     shared.metrics.batches.fetch_add(1, Ordering::Relaxed);
+                    completions.complete_all(&records, shared);
                     break;
                 }
                 Ok(outcome) => {
                     shared.metrics.partial_rejections.fetch_add(1, Ordering::Relaxed);
-                    if records.len() == 1 {
-                        reject_record(shared, outcome.message.as_deref().unwrap_or("collector partially rejected an individual record"));
-                    } else {
-                        split_records(records, &mut pending);
-                    }
+                    shared.metrics.exported.fetch_add(outcome.accepted, Ordering::Relaxed);
+                    shared.metrics.rejected.fetch_add(outcome.rejected, Ordering::Relaxed);
+                    shared.metrics.batches.fetch_add(1, Ordering::Relaxed);
+                    completions.complete_all(&records, shared);
+                    shared.emergency(outcome.message.as_deref().unwrap_or("collector partially rejected an OTLP log batch"));
                     break;
                 }
                 Err(error) if error.is_invalid_payload() => {
                     if records.len() == 1 {
                         reject_record(shared, &error.to_string());
+                        completions.complete(records[0].ticket, shared);
                     } else {
                         split_records(records, &mut pending);
                     }
@@ -319,13 +377,13 @@ async fn export_batch(
     BatchResult::Complete
 }
 
-fn split_records(mut records: Vec<pb::LogRecord>, pending: &mut Vec<Vec<pb::LogRecord>>) {
+fn split_records<T>(mut records: Vec<T>, pending: &mut Vec<Vec<T>>) {
     let right = records.split_off(records.len() / 2);
     pending.push(right);
     pending.push(records);
 }
 
-fn terminal(records: Vec<pb::LogRecord>, mut pending: Vec<Vec<pb::LogRecord>>, error: OtlpHttpError, shared: &Shared) -> BatchResult {
+fn terminal(records: Vec<MappedLog>, mut pending: Vec<Vec<MappedLog>>, error: OtlpHttpError, shared: &Shared) -> BatchResult {
     set_last_error(shared, error.to_string());
     shared.set_status(ExporterStatus::TerminalFailure);
     shared.emergency(&format!("OTLP exporter entered terminal failure: {error}"));

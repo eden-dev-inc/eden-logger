@@ -162,6 +162,38 @@ impl<R: RequestFields> EdenLog<R> {
         self
     }
 
+    /// Estimate bytes retained while this owned record is queued.
+    ///
+    /// This is deliberately cheaper than serialization and is used only for
+    /// bounded sink admission. Custom request fields should provide an
+    /// accurate [`RequestFields::estimated_size_bytes`] implementation.
+    pub fn estimated_size_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of_val(self)
+            .saturating_sub(std::mem::size_of_val(&self.request))
+            .saturating_add(self.message.capacity())
+            .saturating_add(self.request.estimated_size_bytes());
+        for value in [
+            self.trace_id.as_deref(),
+            self.span_id.as_deref(),
+            self.feature.as_deref(),
+            self.function.as_deref(),
+            self.file.as_deref(),
+            self.error_code.as_deref(),
+            self.error_category.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = bytes.saturating_add(value.len());
+        }
+        bytes =
+            bytes.saturating_add(self.additional.capacity().saturating_mul(std::mem::size_of::<(SmolStr, SmolStr)>().saturating_add(1)));
+        for (key, value) in &self.additional {
+            bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+        }
+        bytes
+    }
+
     pub fn from_direct(
         level: LogLevel,
         message: &str,

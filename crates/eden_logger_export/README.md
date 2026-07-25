@@ -67,8 +67,9 @@ ordered intermediary add stable event, stream, epoch, or sequence attributes.
 ## Configuration and security
 
 `ExporterConfig` exposes severity/audience filtering, priority threshold,
-normal and reserved capacities, batch count/bytes/delay, request timeout, retry
-bounds, resource identity, scope name, and diagnostic interval. Its embedded
+normal and reserved record capacities and retained-byte budgets, batch
+count/bytes/delay, request timeout, retry bounds, resource identity, scope
+name, and diagnostic interval. Its embedded
 `OtlpHttpConfig` also supports a gzip threshold, custom headers, additional CA
 bundles, and a PEM client certificate/private-key identity for mTLS.
 
@@ -79,6 +80,9 @@ The direct exporter is intentionally best-effort:
 
 - Normal capacity is 61,440 records, with 4,096 reserved slots available to
   warn/error records when the normal queue is full.
+- Normal and reserved queues have independent 60 MiB and 4 MiB retained-byte
+  budgets. Heap-owning `RequestFields` implementations should override
+  `estimated_size_bytes` for accurate admission accounting.
 - Batches flush at 512 records, 1 MiB encoded, or 200 ms.
 - Transient failures retry with jittered exponential backoff capped at 30
   seconds.
@@ -98,14 +102,21 @@ attempt, retry, rejection, batch, inflight, lane, and lifecycle values.
 `fast_telemetry::MetricVisitor`.
 
 Authentication failures and permanent configuration/status failures stop
-progress and set terminal health. Transient transport errors, 408, 425, 429,
-and 5xx responses retry with jitter and honor `Retry-After`. HTTP 400/413 and
-partial-success responses are bisected until an invalid individual record can
-be rejected without blocking later records.
+progress and set terminal health. Transport failures and HTTP 429/502/503/504
+retry with jitter and honor `Retry-After`; other HTTP failures are terminal
+except 400/413, which are bisected until invalid individual records are
+isolated. OTLP partial-success responses are accounted once and never retried.
 
-`shutdown(deadline)` first stops acceptance, then attempts a bounded drain. Its
-`ShutdownReport` states whether the deadline elapsed and how many records were
-left or counted as shutdown drops.
+`force_flush(deadline)` covers every record accepted before the call without
+stopping future logs. Acceptance tickets and a contiguous completion watermark
+keep this exact even when reserved-priority records overtake normal records.
+
+`reconfigure(config, deadline)` prepares a new client and worker, atomically
+routes new records to it, and boundedly drains the prior generation. Use it to
+rotate endpoints, authorization headers, CA bundles, or mTLS identities without
+a logging outage. `shutdown(deadline)` stops acceptance, releases the typed
+sink for later reinstallation, and attempts a bounded drain. Dropping the
+handle also disables the sink and aborts the worker.
 
 The eight-thread contention benchmark is in `benches/sink_enqueue.rs`; its
 recorded before/after results are in `benches/THREAD_LOCAL_RESULTS.md`.

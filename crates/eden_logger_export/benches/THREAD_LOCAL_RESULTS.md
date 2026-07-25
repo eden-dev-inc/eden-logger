@@ -24,6 +24,26 @@ unused display/JSON line.
 The benchmark asserts p99 below 10 microseconds and fails if any accepted-path
 record is dropped because of queue pressure.
 
+## Safety-hardening follow-up
+
+The lifecycle and memory-safety pass added strict retained-byte admission,
+acceptance tickets for exact force flush, replaceable sink callbacks, and
+shutdown/reconfiguration fencing. An apples-to-apples three-round run compared
+the PR immediately before those changes with the finalized implementation:
+
+| Path | Pre-hardening p99 | Final p99 | Pre-hardening throughput | Final throughput |
+| --- | ---: | ---: | ---: | ---: |
+| Formatted + thread-local | 875 ns | 1,750 ns | 18.49M records/s | 8.35M records/s |
+| Structured-only + thread-local | 709 ns | 1,667 ns | 22.29M records/s | 8.70M records/s |
+| `emit_direct` structured-only | 584 ns | 1,667 ns | 24.95M records/s | 9.01M records/s |
+
+The additional shared atomics are the cost of enforcing one process-wide
+record/byte budget and establishing flush/shutdown linearization across
+producer threads. A first hardened version measured 3,417 ns p99 on the direct
+path; removing duplicate accepted-counter updates and hot-path reference-count
+traffic reduced that to 1,667 ns. The result remains 6× below the 10 µs p99
+acceptance gate while making the advertised 64 MiB default queue bound real.
+
 ## Follow-up CPU profile
 
 The production-style `emit_direct` path was sampled for 10 seconds with

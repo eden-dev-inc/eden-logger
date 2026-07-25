@@ -10,9 +10,10 @@ Planned releases: `eden_logger` 0.1.2 and `eden_logger_export` 0.1.0.
 
 - Added `eden_logger_export`, a bounded Tokio OTLP/HTTP exporter with typed
   Eden-to-OTLP mapping, normal and reserved priority queues, count/byte/time
-  batching, transient retry, partial-rejection bisection, poison-record
-  isolation, TLS/mTLS configuration, health snapshots, native
-  `fast_telemetry::MetricVisitor` metrics, and bounded shutdown.
+  batching, retained-byte admission budgets, OTLP-compliant retry and partial
+  success handling, poison-record isolation, TLS/mTLS configuration, health
+  snapshots, native `fast_telemetry::MetricVisitor` metrics, exact force flush,
+  live endpoint/credential reconfiguration, and bounded shutdown.
 - Added `EdenLogOtlpMapper::map_with_attributes` so shard-stream can attach
   stable stream identity and sequence attributes before acknowledged export.
 - Added `LogTarget::StructuredSink` for deployments where the structured sink
@@ -24,11 +25,18 @@ Planned releases: `eden_logger` 0.1.2 and `eden_logger_export` 0.1.0.
 
 - Added a lightweight `sink` feature independent of Serde. The existing
   `serde` feature still implies `sink` for compatibility.
+- Added lifecycle-managed `register_sink`/`SinkRegistration`; callbacks can be
+  atomically replaced, disabled, dropped, and reinstalled for the same request
+  type while thread-local slot caches remain valid.
+- Added `RequestFields::estimated_size_bytes` and
+  `EdenLog::estimated_size_bytes` for retained-memory admission accounting.
 - Removed serialization bounds from `install_sink`; exporters consume typed
   `RequestFields::write_json` output instead.
-- Cached immutable typed sinks and producer lanes per thread, keeping global
+- Cached replaceable typed sink slots and weak producer lanes per thread,
+  keeping global
   registry lookup, serialization, protobuf encoding, waiting, and network I/O
-  off the steady-state logging path.
+  off the steady-state logging path without retaining stopped exporter
+  generations.
 - Updated the workspace MSRV to Rust 1.93 to match fast-telemetry 0.9 and its
   optional runtime dependencies.
 

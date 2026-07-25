@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eden_logger::{EdenLog, LogAudience, LogLevel, RequestFields};
+use eden_logger::{EdenLog, LogAudience, LogLevel, RequestFields, SinkRegistration};
 use fast_telemetry::otlp::build_resource;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
@@ -37,6 +37,8 @@ use worker::run_worker;
 
 const DEFAULT_NORMAL_CAPACITY: usize = 61_440;
 const DEFAULT_RESERVED_CAPACITY: usize = 4_096;
+const DEFAULT_NORMAL_QUEUE_BYTES: usize = 60 * 1024 * 1024;
+const DEFAULT_RESERVED_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Audience selection applied independently from eden_logger's runtime filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +92,10 @@ pub struct ExporterConfig {
     pub normal_queue_capacity: usize,
     /// Additional global capacity available at or above `priority_threshold`.
     pub reserved_queue_capacity: usize,
+    /// Estimated retained-byte budget available to the normal queue.
+    pub normal_queue_bytes: usize,
+    /// Estimated retained-byte budget available to the reserved queue.
+    pub reserved_queue_bytes: usize,
     /// Maximum records in one OTLP request.
     pub max_batch_records: usize,
     /// Maximum encoded bytes in one OTLP request.
@@ -117,6 +123,8 @@ impl ExporterConfig {
             priority_threshold: LogLevel::Warn,
             normal_queue_capacity: DEFAULT_NORMAL_CAPACITY,
             reserved_queue_capacity: DEFAULT_RESERVED_CAPACITY,
+            normal_queue_bytes: DEFAULT_NORMAL_QUEUE_BYTES,
+            reserved_queue_bytes: DEFAULT_RESERVED_QUEUE_BYTES,
             max_batch_records: 512,
             max_batch_bytes: 1024 * 1024,
             max_batch_delay: Duration::from_millis(200),
@@ -147,6 +155,12 @@ impl ExporterConfig {
     /// Set the per-request timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.http = self.http.with_timeout(timeout);
+        self
+    }
+
+    /// Set the maximum collector response body retained in memory.
+    pub fn with_max_response_bytes(mut self, maximum: usize) -> Self {
+        self.http = self.http.with_max_response_bytes(maximum);
         self
     }
 
@@ -181,6 +195,16 @@ impl ExporterConfig {
         self
     }
 
+    /// Set both record capacities and retained-byte budgets for the normal and
+    /// reserved queues.
+    pub fn with_queue_limits(mut self, normal_records: usize, reserved_records: usize, normal_bytes: usize, reserved_bytes: usize) -> Self {
+        self.normal_queue_capacity = normal_records;
+        self.reserved_queue_capacity = reserved_records;
+        self.normal_queue_bytes = normal_bytes;
+        self.reserved_queue_bytes = reserved_bytes;
+        self
+    }
+
     /// Set batch record, encoded-byte, and maximum-delay limits.
     pub fn with_batch_limits(mut self, records: usize, bytes: usize, delay: Duration) -> Self {
         self.max_batch_records = records;
@@ -203,8 +227,14 @@ impl ExporterConfig {
         if self.scope_name.trim().is_empty() {
             return Err(InstallError::InvalidConfig("scope_name must not be empty".to_string()));
         }
-        if self.normal_queue_capacity == 0 || self.reserved_queue_capacity == 0 {
-            return Err(InstallError::InvalidConfig("queue capacities must be greater than zero".to_string()));
+        if self.normal_queue_capacity == 0
+            || self.reserved_queue_capacity == 0
+            || self.normal_queue_bytes == 0
+            || self.reserved_queue_bytes == 0
+        {
+            return Err(InstallError::InvalidConfig(
+                "queue record capacities and byte budgets must be greater than zero".to_string(),
+            ));
         }
         if self.max_batch_records == 0 || self.max_batch_bytes == 0 || self.max_batch_delay.is_zero() {
             return Err(InstallError::InvalidConfig("batch limits and delay must be greater than zero".to_string()));
@@ -294,9 +324,14 @@ impl From<OtlpHttpError> for InstallError {
 
 pub(crate) struct Shared {
     pub accepting: AtomicBool,
+    pub active_submissions: AtomicU64,
+    pub next_ticket: AtomicU64,
+    pub completed_ticket: AtomicU64,
     pub metrics: ExporterMetrics,
     pub shutdown: Notify,
     pub records: Notify,
+    pub flush: Notify,
+    pub progress: Notify,
     pub diagnostic_interval_millis: u64,
     pub last_diagnostic_millis: AtomicU64,
     pub last_error: Mutex<Option<String>>,
@@ -317,16 +352,91 @@ impl Shared {
             eprintln!("[eden_logger_export emergency] {message}");
         }
     }
+
+    fn metrics_snapshot(&self) -> ExporterMetricsSnapshot {
+        self.metrics.snapshot(self.next_ticket.load(Ordering::Acquire))
+    }
+}
+
+struct ActiveSubmission<'a> {
+    shared: &'a Shared,
+}
+
+impl<'a> ActiveSubmission<'a> {
+    fn begin(shared: &'a Shared) -> Self {
+        shared.active_submissions.fetch_add(1, Ordering::AcqRel);
+        Self { shared }
+    }
+}
+
+impl Drop for ActiveSubmission<'_> {
+    fn drop(&mut self) {
+        decrement(&self.shared.active_submissions);
+        self.shared.records.notify_one();
+    }
+}
+
+/// Result category from a non-terminal force flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushStatus {
+    /// Every record accepted before the call completed.
+    Flushed,
+    /// The supplied deadline elapsed first.
+    TimedOut,
+    /// Export stopped on a permanent collector or transport error.
+    TerminalFailure,
+    /// The worker stopped before the target completed.
+    Stopped,
+}
+
+/// Result of [`ExporterHandle::force_flush`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushReport {
+    /// Why the operation returned.
+    pub status: FlushStatus,
+    /// Highest acceptance ticket covered by this flush.
+    pub target_ticket: u64,
+    /// Highest contiguous completed ticket at return.
+    pub completed_ticket: u64,
+}
+
+/// Failure while replacing an exporter's endpoint, credentials, or policy.
+#[derive(Debug)]
+pub enum ReconfigureError {
+    /// The replacement configuration or transport could not be prepared.
+    Install(InstallError),
+    /// The managed Eden sink registration was no longer active.
+    Sink(&'static str),
+}
+
+impl fmt::Display for ReconfigureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Install(error) => write!(formatter, "failed to prepare replacement exporter: {error}"),
+            Self::Sink(error) => write!(formatter, "failed to replace Eden sink: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ReconfigureError {}
+
+impl From<InstallError> for ReconfigureError {
+    fn from(error: InstallError) -> Self {
+        Self::Install(error)
+    }
 }
 
 /// Handle for health, metrics, and bounded shutdown.
-pub struct ExporterHandle {
+#[must_use = "dropping the handle stops this exporter generation"]
+pub struct ExporterHandle<R: RequestFields = ()> {
+    runtime: Handle,
     shared: Arc<Shared>,
     collector: Arc<dyn CollectorControl>,
     worker: Option<JoinHandle<ShutdownReport>>,
+    registration: Option<SinkRegistration<R>>,
 }
 
-impl ExporterHandle {
+impl<R: RequestFields> ExporterHandle<R> {
     /// Return the current exporter lifecycle state.
     pub fn status(&self) -> ExporterStatus {
         ExporterStatus::from_u8(self.shared.metrics.status.load(Ordering::Acquire))
@@ -339,7 +449,7 @@ impl ExporterHandle {
 
     /// Snapshot cumulative counters and current gauges.
     pub fn metrics_snapshot(&self) -> ExporterMetricsSnapshot {
-        self.shared.metrics.snapshot()
+        self.shared.metrics_snapshot()
     }
 
     /// Emit the current snapshot through fast-telemetry's native visitor API.
@@ -347,54 +457,99 @@ impl ExporterHandle {
         visit_exporter_metrics(&self.metrics_snapshot(), visitor);
     }
 
+    /// Export every record accepted before this call without stopping future
+    /// acceptance.
+    pub async fn force_flush(&self, deadline: Duration) -> FlushReport {
+        let target = self.shared.next_ticket.load(Ordering::Acquire);
+        self.shared.flush.notify_one();
+        let wait = async {
+            loop {
+                let notified = self.shared.progress.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let completed = self.shared.completed_ticket.load(Ordering::Acquire);
+                if completed >= target {
+                    return FlushReport {
+                        status: FlushStatus::Flushed,
+                        target_ticket: target,
+                        completed_ticket: completed,
+                    };
+                }
+                let status = self.status();
+                if status == ExporterStatus::TerminalFailure || status == ExporterStatus::Stopped {
+                    return FlushReport {
+                        status: if status == ExporterStatus::TerminalFailure {
+                            FlushStatus::TerminalFailure
+                        } else {
+                            FlushStatus::Stopped
+                        },
+                        target_ticket: target,
+                        completed_ticket: completed,
+                    };
+                }
+                notified.await;
+            }
+        };
+        match tokio::time::timeout(deadline, wait).await {
+            Ok(report) => report,
+            Err(_) => FlushReport {
+                status: FlushStatus::TimedOut,
+                target_ticket: target,
+                completed_ticket: self.shared.completed_ticket.load(Ordering::Acquire),
+            },
+        }
+    }
+
+    /// Atomically route new records to a freshly prepared exporter generation,
+    /// then boundedly drain the previous one.
+    ///
+    /// This supports endpoint, header, certificate, identity, filter, queue,
+    /// and batching changes without uninstalling the typed Eden sink.
+    pub async fn reconfigure(&mut self, config: ExporterConfig, deadline: Duration) -> Result<ShutdownReport, ReconfigureError> {
+        let prepared = prepare_generation::<R>(&self.runtime, config)?;
+        let Some(registration) = self.registration.as_mut() else {
+            prepared.worker.abort();
+            return Err(ReconfigureError::Sink("eden_logger exporter registration is inactive"));
+        };
+        registration
+            .replace(make_sink(Arc::clone(&prepared.shared), Arc::clone(&prepared.collector), prepared.filter))
+            .map_err(|error| {
+                prepared.worker.abort();
+                ReconfigureError::Sink(error)
+            })?;
+
+        let old_shared = std::mem::replace(&mut self.shared, prepared.shared);
+        let old_collector = std::mem::replace(&mut self.collector, prepared.collector);
+        let old_worker = self.worker.replace(prepared.worker);
+        Ok(drain_generation(old_shared, old_collector, old_worker, deadline).await)
+    }
+
     /// Stop accepting records and drain until completion or `deadline`.
     pub async fn shutdown(mut self, deadline: Duration) -> ShutdownReport {
-        self.shared.accepting.store(false, Ordering::Release);
-        self.shared.set_status(ExporterStatus::ShuttingDown);
-        self.shared.shutdown.notify_one();
-
-        let Some(mut worker) = self.worker.take() else {
-            return ShutdownReport {
-                timed_out: false,
-                remaining_records: 0,
-                metrics: self.shared.metrics.snapshot(),
-            };
-        };
-
-        match tokio::time::timeout(deadline, &mut worker).await {
-            Ok(Ok(report)) => report,
-            Ok(Err(error)) => {
-                set_last_error(&self.shared, format!("exporter worker failed: {error}"));
-                self.collector.clear();
-                self.shared.set_status(ExporterStatus::Stopped);
-                ShutdownReport {
-                    timed_out: false,
-                    remaining_records: remaining_records(&self.shared),
-                    metrics: self.shared.metrics.snapshot(),
-                }
-            }
-            Err(_) => {
-                worker.abort();
-                let _ = worker.await;
-                let remaining = remaining_records(&self.shared);
-                self.collector.clear();
-                self.shared.metrics.dropped_shutdown.fetch_add(remaining, Ordering::Relaxed);
-                self.shared.metrics.normal_queue_depth.store(0, Ordering::Relaxed);
-                self.shared.metrics.reserved_queue_depth.store(0, Ordering::Relaxed);
-                self.shared.metrics.inflight.store(0, Ordering::Relaxed);
-                self.shared.set_status(ExporterStatus::Stopped);
-                ShutdownReport {
-                    timed_out: true,
-                    remaining_records: remaining,
-                    metrics: self.shared.metrics.snapshot(),
-                }
-            }
+        stop_acceptance(&self.shared);
+        if let Some(mut registration) = self.registration.take() {
+            registration.disable();
         }
+        drain_generation(Arc::clone(&self.shared), Arc::clone(&self.collector), self.worker.take(), deadline).await
+    }
+}
+
+impl<R: RequestFields> Drop for ExporterHandle<R> {
+    fn drop(&mut self) {
+        stop_acceptance(&self.shared);
+        self.registration.take();
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
+        }
+        let remaining = remaining_records(&self.shared);
+        self.shared.metrics.dropped_shutdown.fetch_add(remaining, Ordering::Relaxed);
+        self.shared.set_status(ExporterStatus::Stopped);
+        self.shared.progress.notify_waiters();
     }
 }
 
 /// Install on the current Tokio runtime.
-pub fn install<R>(config: ExporterConfig) -> Result<ExporterHandle, InstallError>
+pub fn install<R>(config: ExporterConfig) -> Result<ExporterHandle<R>, InstallError>
 where
     R: RequestFields,
 {
@@ -406,7 +561,45 @@ where
 ///
 /// This is useful when setup occurs outside the runtime thread that will own
 /// the exporter worker.
-pub fn install_on<R>(runtime: &Handle, config: ExporterConfig) -> Result<ExporterHandle, InstallError>
+pub fn install_on<R>(runtime: &Handle, config: ExporterConfig) -> Result<ExporterHandle<R>, InstallError>
+where
+    R: RequestFields,
+{
+    let prepared = prepare_generation::<R>(runtime, config)?;
+    let registration =
+        match eden_logger::register_sink::<R, _>(make_sink(Arc::clone(&prepared.shared), Arc::clone(&prepared.collector), prepared.filter))
+        {
+            Ok(registration) => registration,
+            Err(_) => {
+                stop_acceptance(&prepared.shared);
+                prepared.worker.abort();
+                return Err(InstallError::SinkAlreadyInstalled);
+            }
+        };
+    Ok(ExporterHandle {
+        runtime: runtime.clone(),
+        shared: prepared.shared,
+        collector: prepared.collector,
+        worker: Some(prepared.worker),
+        registration: Some(registration),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct SinkFilter {
+    min_level: LogLevel,
+    audiences: AudienceFilter,
+    priority_threshold: LogLevel,
+}
+
+struct PreparedGeneration<R: RequestFields> {
+    shared: Arc<Shared>,
+    collector: Arc<LogCollector<R>>,
+    worker: JoinHandle<ShutdownReport>,
+    filter: SinkFilter,
+}
+
+fn prepare_generation<R>(runtime: &Handle, config: ExporterConfig) -> Result<PreparedGeneration<R>, InstallError>
 where
     R: RequestFields,
 {
@@ -417,47 +610,133 @@ where
 
     let shared = Arc::new(Shared {
         accepting: AtomicBool::new(true),
+        active_submissions: AtomicU64::new(0),
+        next_ticket: AtomicU64::new(0),
+        completed_ticket: AtomicU64::new(0),
         metrics: ExporterMetrics::default(),
         shutdown: Notify::new(),
         records: Notify::new(),
+        flush: Notify::new(),
+        progress: Notify::new(),
         diagnostic_interval_millis: duration_millis(config.diagnostic_interval),
         last_diagnostic_millis: AtomicU64::new(0),
         last_error: Mutex::new(None),
     });
-    let collector = LogCollector::new(config.normal_queue_capacity, config.reserved_queue_capacity, Arc::clone(&shared));
+    let collector = LogCollector::new(
+        config.normal_queue_capacity,
+        config.reserved_queue_capacity,
+        config.normal_queue_bytes,
+        config.reserved_queue_bytes,
+        Arc::clone(&shared),
+    );
+    let filter = SinkFilter {
+        min_level: config.min_level,
+        audiences: config.audiences,
+        priority_threshold: config.priority_threshold,
+    };
+    let worker = runtime.spawn(run_worker(config, client, resource, Arc::clone(&collector), Arc::clone(&shared)));
+    Ok(PreparedGeneration { shared, collector, worker, filter })
+}
 
-    let sink_shared = Arc::clone(&shared);
-    let sink_collector = Arc::clone(&collector);
-    let handle_collector: Arc<dyn CollectorControl> = collector.clone();
-    let min_level = config.min_level;
-    let audiences = config.audiences;
-    let priority_threshold = config.priority_threshold;
-    eden_logger::install_sink::<R, _>(move |log: EdenLog<R>| {
+fn make_sink<R>(
+    sink_shared: Arc<Shared>,
+    sink_collector: Arc<LogCollector<R>>,
+    filter: SinkFilter,
+) -> impl Fn(EdenLog<R>) + Send + Sync + 'static
+where
+    R: RequestFields,
+{
+    move |log: EdenLog<R>| {
+        let _submission = ActiveSubmission::begin(&sink_shared);
         if !sink_shared.accepting.load(Ordering::Acquire) {
             sink_shared.metrics.dropped_stopped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if log.level < min_level || !audiences.allows(log.audience) {
+        if log.level < filter.min_level || !filter.audiences.allows(log.audience) {
             sink_shared.metrics.filtered.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
-        let priority = log.level >= priority_threshold;
+        let priority = log.level >= filter.priority_threshold;
         match sink_collector.submit(log, priority) {
-            SubmitResult::Accepted => {
-                sink_shared.metrics.accepted.fetch_add(1, Ordering::Relaxed);
-            }
-            SubmitResult::Full => {
+            SubmitResult::Accepted => {}
+            SubmitResult::RecordCapacity => {
                 sink_shared.metrics.dropped_queue_full.fetch_add(1, Ordering::Relaxed);
-                sink_shared.emergency("bounded log queues are full; records are being dropped");
+                sink_shared.emergency("bounded log queue record capacities are full; records are being dropped");
+            }
+            SubmitResult::ByteCapacity => {
+                sink_shared.metrics.dropped_queue_bytes_full.fetch_add(1, Ordering::Relaxed);
+                sink_shared.emergency("bounded log queue byte budgets are full; records are being dropped");
             }
         }
-    })
-    .map_err(|_| InstallError::SinkAlreadyInstalled)?;
+    }
+}
 
-    let worker_shared = Arc::clone(&shared);
-    let worker = runtime.spawn(run_worker(config, client, resource, collector, worker_shared));
-    Ok(ExporterHandle { shared, collector: handle_collector, worker: Some(worker) })
+fn stop_acceptance(shared: &Shared) {
+    shared.accepting.store(false, Ordering::Release);
+    if shared.metrics.status.load(Ordering::Acquire) != ExporterStatus::Stopped as u8 {
+        shared.set_status(ExporterStatus::ShuttingDown);
+    }
+    // Each generation has one worker. `notify_one` retains a permit when
+    // shutdown wins the race before that worker starts polling.
+    shared.shutdown.notify_one();
+    shared.records.notify_one();
+    shared.flush.notify_one();
+}
+
+async fn drain_generation(
+    shared: Arc<Shared>,
+    _collector: Arc<dyn CollectorControl>,
+    worker: Option<JoinHandle<ShutdownReport>>,
+    deadline: Duration,
+) -> ShutdownReport {
+    stop_acceptance(&shared);
+    let Some(mut worker) = worker else {
+        return ShutdownReport {
+            timed_out: false,
+            remaining_records: remaining_records(&shared),
+            metrics: shared.metrics_snapshot(),
+        };
+    };
+
+    match tokio::time::timeout(deadline, &mut worker).await {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            set_last_error(&shared, format!("exporter worker failed: {error}"));
+            let remaining = remaining_records(&shared);
+            shared.metrics.dropped_shutdown.fetch_add(remaining, Ordering::Relaxed);
+            reset_live_metrics(&shared);
+            shared.set_status(ExporterStatus::Stopped);
+            shared.progress.notify_waiters();
+            ShutdownReport {
+                timed_out: false,
+                remaining_records: remaining,
+                metrics: shared.metrics_snapshot(),
+            }
+        }
+        Err(_) => {
+            worker.abort();
+            let _ = worker.await;
+            let remaining = remaining_records(&shared);
+            shared.metrics.dropped_shutdown.fetch_add(remaining, Ordering::Relaxed);
+            reset_live_metrics(&shared);
+            shared.set_status(ExporterStatus::Stopped);
+            shared.progress.notify_waiters();
+            ShutdownReport {
+                timed_out: true,
+                remaining_records: remaining,
+                metrics: shared.metrics_snapshot(),
+            }
+        }
+    }
+}
+
+fn reset_live_metrics(shared: &Shared) {
+    shared.metrics.normal_queue_depth.store(0, Ordering::Relaxed);
+    shared.metrics.reserved_queue_depth.store(0, Ordering::Relaxed);
+    shared.metrics.normal_queue_bytes.store(0, Ordering::Relaxed);
+    shared.metrics.reserved_queue_bytes.store(0, Ordering::Relaxed);
+    shared.metrics.inflight.store(0, Ordering::Relaxed);
 }
 
 pub(crate) fn set_last_error(shared: &Shared, message: String) {
@@ -517,6 +796,14 @@ mod tests {
 
         let mut config = valid.clone();
         config.reserved_queue_capacity = 0;
+        cases.push(config);
+
+        let mut config = valid.clone();
+        config.normal_queue_bytes = 0;
+        cases.push(config);
+
+        let mut config = valid.clone();
+        config.reserved_queue_bytes = 0;
         cases.push(config);
 
         let mut config = valid.clone();

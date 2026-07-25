@@ -295,6 +295,6 @@ pub use filter::{clear_filter, disable_levels, enable_levels, init_from_env, ini
 pub use metrics::{LogAudienceMetrics, LogLevelMetrics, LogMetricsSnapshot, log_metrics_snapshot, visit_log_metrics};
 pub use schema::{EdenLog, LogLevel, emit_direct, write_display_direct, write_json_direct};
 #[cfg(feature = "sink")]
-pub use sink::install_sink;
+pub use sink::{SinkRegistration, install_sink, register_sink};
 pub use trace::{TraceContextExt, TraceSource, extract_trace_context, set_trace_source, trace_context, trace_source};
 pub use writer::{LogFormat, LogTarget, WriterConfig, init};

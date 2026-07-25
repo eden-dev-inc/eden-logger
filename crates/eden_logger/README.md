@@ -251,8 +251,11 @@ install_sink::<(), _>(|log: EdenLog<()>| {
 ```
 
 Sinks are keyed by the `RequestFields` type, so different `R` instantiations
-have independent slots. Each thread caches the immutable typed sink after its
-first lookup, avoiding the global registry lock on steady-state dispatch.
+have independent slots. Each thread caches a stable typed slot after its first
+lookup, avoiding the global registry lock on steady-state dispatch. The
+compatibility `install_sink` API remains installed for the process lifetime;
+use `register_sink` when an integration must atomically replace or later
+disable its callback.
 Use the companion `eden_logger_export` crate for a bounded Tokio OTLP/HTTP
 worker, or install a shard-stream bridge when delivery needs HA spooling and
 ordered replay.

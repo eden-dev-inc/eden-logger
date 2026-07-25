@@ -72,6 +72,17 @@ pub trait RequestFields: Clone + Default + Send + Sync + 'static {
 
     /// Merge another instance into self. Set fields in `other` override self.
     fn merge(&mut self, other: Self);
+
+    /// Estimate the total bytes retained by this value, including owned heap
+    /// allocations.
+    ///
+    /// The default covers inline storage. Implementors that own `String`,
+    /// `Vec`, maps, or other heap-backed values should override this method so
+    /// bounded sinks can account for their retained memory before admission.
+    #[inline]
+    fn estimated_size_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+    }
 }
 
 impl RequestFields for () {

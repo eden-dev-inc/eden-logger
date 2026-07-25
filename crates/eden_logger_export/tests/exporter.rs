@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use eden_logger::{EdenLog, FieldWriter, LogAudience, LogContext, LogLevel, RequestFields};
 use eden_logger_export::{
-    ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse, ExporterConfig, ExporterStatus, install,
+    ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse, ExporterConfig, ExporterStatus, FlushStatus, install,
 };
 use flate2::read::GzDecoder;
 use prost::Message;
@@ -254,12 +254,8 @@ impl RequestFields for PartialFields {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn bisects_partial_success_until_a_poison_record_is_isolated() {
-    let (endpoint, _captured, server) = collector(vec![
-        Reply::partial(1, "one invalid record"),
-        Reply::success(),
-        Reply::partial(1, "invalid record"),
-    ]);
+async fn accounts_for_partial_success_without_retrying_the_batch() {
+    let (endpoint, _captured, server) = collector(vec![Reply::partial(1, "one invalid record")]);
     let mut config = ExporterConfig::new(endpoint, "checkout").with_batch_limits(2, 1024 * 1024, Duration::from_millis(50));
     config.http.gzip_threshold = usize::MAX;
     let exporter = install::<PartialFields>(config).expect("install exporter");
@@ -273,12 +269,12 @@ async fn bisects_partial_success_until_a_poison_record_is_isolated() {
             let metrics = exporter.metrics_snapshot();
             metrics.exported == 1 && metrics.rejected == 1
         },
-        "partial rejection was not isolated",
+        "partial rejection was not accounted",
     )
     .await;
     let metrics = exporter.metrics_snapshot();
-    assert_eq!(metrics.partial_rejections, 2);
-    assert_eq!(metrics.export_attempts, 3);
+    assert_eq!(metrics.partial_rejections, 1);
+    assert_eq!(metrics.export_attempts, 1);
 
     let report = exporter.shutdown(Duration::from_secs(1)).await;
     assert!(!report.timed_out);
@@ -347,6 +343,10 @@ async fn authentication_failure_sets_terminal_health() {
     wait_for(|| exporter.status() == ExporterStatus::TerminalFailure, "terminal state was not reported").await;
     assert_eq!(exporter.metrics_snapshot().status, ExporterStatus::TerminalFailure);
     assert!(exporter.last_error().is_some_and(|error| error.contains("401")));
+    let flush = exporter.force_flush(Duration::from_millis(50)).await;
+    assert_eq!(flush.status, FlushStatus::TerminalFailure);
+    assert_eq!(flush.target_ticket, 1);
+    assert_eq!(flush.completed_ticket, 0);
 
     let report = exporter.shutdown(Duration::from_secs(1)).await;
     assert_eq!(report.remaining_records, 1);
@@ -395,6 +395,182 @@ async fn queue_pressure_preserves_reserved_warn_capacity() {
     let third = captured.recv_timeout(Duration::from_secs(1)).expect("third captured request");
     assert_eq!(captured_message(&second), "reserved warning");
     assert_eq!(captured_message(&third), "normal queue");
+    let report = exporter.shutdown(Duration::from_secs(1)).await;
+    assert!(!report.timed_out);
+    server.join().expect("collector thread");
+}
+
+#[derive(Clone, Default)]
+struct FlushFields;
+
+impl RequestFields for FlushFields {
+    fn write_display(&self, _: &mut dyn FieldWriter) {}
+    fn write_json(&self, _: &mut dyn FieldWriter) {}
+    fn merge(&mut self, _: Self) {}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn force_flush_wakes_batching_without_stopping_acceptance() {
+    let (endpoint, _captured, server) = collector(vec![Reply::success(), Reply::success()]);
+    let mut config = ExporterConfig::new(endpoint, "checkout").with_batch_limits(512, 1024 * 1024, Duration::from_secs(30));
+    config.http.gzip_threshold = usize::MAX;
+    let exporter = install::<FlushFields>(config).expect("install exporter");
+    let context = LogContext::<FlushFields>::new();
+
+    EdenLog::new(LogLevel::Info, "first flush", &context, LogAudience::Internal).emit();
+    let first = exporter.force_flush(Duration::from_secs(1)).await;
+    assert_eq!(first.status, FlushStatus::Flushed);
+    assert_eq!(first.target_ticket, 1);
+    assert_eq!(first.completed_ticket, 1);
+    assert_eq!(exporter.status(), ExporterStatus::Running);
+
+    EdenLog::new(LogLevel::Warn, "second flush", &context, LogAudience::Internal).emit();
+    let second = exporter.force_flush(Duration::from_secs(1)).await;
+    assert_eq!(second.status, FlushStatus::Flushed);
+    assert_eq!(second.target_ticket, 2);
+    assert_eq!(exporter.metrics_snapshot().exported, 2);
+
+    let report = exporter.shutdown(Duration::from_secs(1)).await;
+    assert!(!report.timed_out);
+    server.join().expect("collector thread");
+}
+
+#[derive(Clone, Default)]
+struct ReconfigureFields;
+
+impl RequestFields for ReconfigureFields {
+    fn write_display(&self, _: &mut dyn FieldWriter) {}
+    fn write_json(&self, _: &mut dyn FieldWriter) {}
+    fn merge(&mut self, _: Self) {}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn atomically_reconfigures_endpoint_and_headers() {
+    let (first_endpoint, first_captured, first_server) = collector(vec![Reply::success()]);
+    let (second_endpoint, second_captured, second_server) = collector(vec![Reply::success()]);
+    let mut first_config = ExporterConfig::new(first_endpoint, "checkout").with_header("authorization", "Bearer old").with_batch_limits(
+        1,
+        1024 * 1024,
+        Duration::from_millis(10),
+    );
+    first_config.http.gzip_threshold = usize::MAX;
+    let mut exporter = install::<ReconfigureFields>(first_config).expect("install exporter");
+    let context = LogContext::<ReconfigureFields>::new();
+
+    EdenLog::new(LogLevel::Info, "before rotation", &context, LogAudience::Internal).emit();
+    wait_for(|| exporter.metrics_snapshot().exported == 1, "first generation did not export").await;
+    let first = first_captured.recv_timeout(Duration::from_secs(1)).expect("first request");
+    assert!(first.head.to_ascii_lowercase().contains("authorization: bearer old"));
+
+    let mut second_config = ExporterConfig::new(second_endpoint, "checkout").with_header("authorization", "Bearer new").with_batch_limits(
+        1,
+        1024 * 1024,
+        Duration::from_millis(10),
+    );
+    second_config.http.gzip_threshold = usize::MAX;
+    let old = exporter.reconfigure(second_config, Duration::from_secs(1)).await.expect("replace exporter generation");
+    assert!(!old.timed_out);
+
+    EdenLog::new(LogLevel::Info, "after rotation", &context, LogAudience::Internal).emit();
+    wait_for(|| exporter.metrics_snapshot().exported == 1, "replacement generation did not export").await;
+    let second = second_captured.recv_timeout(Duration::from_secs(1)).expect("second request");
+    assert!(second.head.to_ascii_lowercase().contains("authorization: bearer new"));
+    assert_eq!(captured_message(&second), "after rotation");
+
+    let report = exporter.shutdown(Duration::from_secs(1)).await;
+    assert!(!report.timed_out);
+    first_server.join().expect("first collector thread");
+    second_server.join().expect("second collector thread");
+}
+
+#[derive(Clone, Default)]
+struct FailedReconfigureFields;
+
+impl RequestFields for FailedReconfigureFields {
+    fn write_display(&self, _: &mut dyn FieldWriter) {}
+    fn write_json(&self, _: &mut dyn FieldWriter) {}
+    fn merge(&mut self, _: Self) {}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_reconfiguration_leaves_the_current_generation_active() {
+    let (endpoint, _captured, server) = collector(vec![Reply::success(), Reply::success()]);
+    let config = ExporterConfig::new(endpoint, "checkout").with_batch_limits(1, 1024 * 1024, Duration::from_millis(10));
+    let mut exporter = install::<FailedReconfigureFields>(config).expect("install exporter");
+    let context = LogContext::<FailedReconfigureFields>::new();
+    EdenLog::new(LogLevel::Info, "before failed rotation", &context, LogAudience::Internal).emit();
+    wait_for(|| exporter.metrics_snapshot().exported == 1, "first record did not export").await;
+
+    let invalid = ExporterConfig::new("not a valid URL", "checkout");
+    assert!(exporter.reconfigure(invalid, Duration::from_secs(1)).await.is_err());
+    assert_eq!(exporter.status(), ExporterStatus::Running);
+
+    EdenLog::new(LogLevel::Info, "after failed rotation", &context, LogAudience::Internal).emit();
+    wait_for(|| exporter.metrics_snapshot().exported == 2, "old generation stopped after failed replacement").await;
+    let report = exporter.shutdown(Duration::from_secs(1)).await;
+    assert!(!report.timed_out);
+    server.join().expect("collector thread");
+}
+
+#[derive(Clone, Default)]
+struct ReinstallFields;
+
+impl RequestFields for ReinstallFields {
+    fn write_display(&self, _: &mut dyn FieldWriter) {}
+    fn write_json(&self, _: &mut dyn FieldWriter) {}
+    fn merge(&mut self, _: Self) {}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_releases_the_typed_sink_for_reinstallation() {
+    let (first_endpoint, _first_captured, first_server) = collector(vec![Reply::success()]);
+    let first_config = ExporterConfig::new(first_endpoint, "checkout").with_batch_limits(1, 1024 * 1024, Duration::from_millis(10));
+    let first = install::<ReinstallFields>(first_config).expect("first installation");
+    EdenLog::new(LogLevel::Info, "first generation", &LogContext::<ReinstallFields>::new(), LogAudience::Internal).emit();
+    let report = first.shutdown(Duration::from_secs(1)).await;
+    assert!(!report.timed_out);
+    first_server.join().expect("first collector thread");
+
+    let (second_endpoint, _second_captured, second_server) = collector(vec![Reply::success()]);
+    let second_config = ExporterConfig::new(second_endpoint, "checkout").with_batch_limits(1, 1024 * 1024, Duration::from_millis(10));
+    let second = install::<ReinstallFields>(second_config).expect("second installation");
+    EdenLog::new(LogLevel::Info, "second generation", &LogContext::<ReinstallFields>::new(), LogAudience::Internal).emit();
+    let report = second.shutdown(Duration::from_secs(1)).await;
+    assert!(!report.timed_out);
+    assert_eq!(report.metrics.exported, 1);
+    second_server.join().expect("second collector thread");
+}
+
+#[derive(Clone, Default)]
+struct InvalidBatchFields;
+
+impl RequestFields for InvalidBatchFields {
+    fn write_display(&self, _: &mut dyn FieldWriter) {}
+    fn write_json(&self, _: &mut dyn FieldWriter) {}
+    fn merge(&mut self, _: Self) {}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bisects_http_invalid_payload_responses_only() {
+    let (endpoint, _captured, server) = collector(vec![
+        Reply {
+            status: 400,
+            headers: Vec::new(),
+            body: b"invalid request".to_vec(),
+            delay: Duration::ZERO,
+        },
+        Reply::success(),
+        Reply::success(),
+    ]);
+    let mut config = ExporterConfig::new(endpoint, "checkout").with_batch_limits(2, 1024 * 1024, Duration::from_millis(50));
+    config.http.gzip_threshold = usize::MAX;
+    let exporter = install::<InvalidBatchFields>(config).expect("install exporter");
+    let context = LogContext::<InvalidBatchFields>::new();
+    EdenLog::new(LogLevel::Info, "left", &context, LogAudience::Internal).emit();
+    EdenLog::new(LogLevel::Info, "right", &context, LogAudience::Internal).emit();
+
+    wait_for(|| exporter.metrics_snapshot().exported == 2, "invalid batch was not bisected").await;
+    assert_eq!(exporter.metrics_snapshot().export_attempts, 3);
     let report = exporter.shutdown(Duration::from_secs(1)).await;
     assert!(!report.timed_out);
     server.join().expect("collector thread");

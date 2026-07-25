@@ -71,7 +71,14 @@ fn main() {
     collector.1.join().expect("collector thread");
 }
 
-fn run_mode(name: &str, target: LogTarget, direct: bool, rounds: usize, profile: bool, exporter: &eden_logger_export::ExporterHandle) {
+fn run_mode(
+    name: &str,
+    target: LogTarget,
+    direct: bool,
+    rounds: usize,
+    profile: bool,
+    exporter: &eden_logger_export::ExporterHandle<BenchFields>,
+) {
     assert!(rounds > 0, "EDEN_EXPORT_BENCH_ROUNDS must be greater than zero");
     let mut measurement = None;
     for _ in 0..rounds {
@@ -155,7 +162,7 @@ fn throughput(measurement: &Measurement) -> f64 {
     (THREADS * RECORDS_PER_THREAD) as f64 / measurement.elapsed.as_secs_f64()
 }
 
-fn wait_for_drain(exporter: &eden_logger_export::ExporterHandle) {
+fn wait_for_drain(exporter: &eden_logger_export::ExporterHandle<BenchFields>) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let metrics = exporter.metrics_snapshot();

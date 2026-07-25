@@ -8,8 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
-  FAST_TELEMETRY_PATCH: patch.crates-io.fast-telemetry.path="${{ github.workspace }}/.ci/fast-telemetry/crates/fast-telemetry"
-  FAST_TELEMETRY_EXPORT_PATCH: patch.crates-io.fast-telemetry-export.path="${{ github.workspace }}/.ci/fast-telemetry/crates/fast-telemetry-export"
+  FAST_TELEMETRY_PATCH: patch.crates-io.fast-telemetry.path="${{ runner.temp }}/fast-telemetry/crates/fast-telemetry"
+  FAST_TELEMETRY_EXPORT_PATCH: patch.crates-io.fast-telemetry-export.path="${{ runner.temp }}/fast-telemetry/crates/fast-telemetry-export"
 
 jobs:
   quality:
@@ -22,6 +22,8 @@ jobs:
           repository: eden-dev-inc/fast-telemetry
           ref: dt/otlp-log-export
           path: .ci/fast-telemetry
+      - name: Relocate Fast Telemetry outside the Eden workspace
+        run: mv .ci/fast-telemetry "$RUNNER_TEMP/fast-telemetry"
       - uses: dtolnay/rust-toolchain@1.93
         with:
           components: clippy, rustfmt
