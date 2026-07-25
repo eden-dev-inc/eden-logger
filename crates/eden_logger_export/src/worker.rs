@@ -136,7 +136,7 @@ where
                     pending.push_back(map_log(&mapper, log));
                     continue;
                 }
-                if shared.active_submissions.load(Ordering::Acquire) != 0 {
+                if !shared.producers_closed.load(Ordering::Acquire) {
                     shared.records.notified().await;
                     continue;
                 }
@@ -218,7 +218,7 @@ where
                 if shared.accepting.load(Ordering::Acquire) {
                     shared.shutdown.notified().await;
                 }
-                while shared.active_submissions.load(Ordering::Acquire) != 0 {
+                while !shared.producers_closed.load(Ordering::Acquire) {
                     shared.records.notified().await;
                 }
                 let queued = shared

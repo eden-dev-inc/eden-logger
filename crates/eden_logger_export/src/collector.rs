@@ -246,7 +246,7 @@ impl<R: RequestFields> LogCollector<R> {
             return failure.submit_result();
         }
 
-        let ticket = self.shared.next_ticket.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        let ticket = self.shared.next_ticket.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         if lane.push(QueuedLog { log, queue, bytes, ticket }) {
             self.shared.records.notify_one();
         }
@@ -372,22 +372,25 @@ fn claim_amount(depth: &AtomicU64, capacity: u64, amount: u64) -> bool {
     }
     if capacity > u64::MAX / 2 {
         return depth
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(amount).filter(|next| *next <= capacity)
             })
             .is_ok();
     }
-    let previous = depth.fetch_add(amount, Ordering::AcqRel);
+    // These atomics account capacity only; lane mutexes publish payloads.
+    // Their modification order is sufficient to keep admission bounded.
+    let previous = depth.fetch_add(amount, Ordering::Relaxed);
     if previous <= capacity - amount {
         true
     } else {
-        depth.fetch_sub(amount, Ordering::Release);
+        depth.fetch_sub(amount, Ordering::Relaxed);
         false
     }
 }
 
 fn subtract(depth: &AtomicU64, amount: u64) {
-    let _ = depth.fetch_update(Ordering::Release, Ordering::Relaxed, |current| Some(current.saturating_sub(amount)));
+    let previous = depth.fetch_sub(amount, Ordering::Relaxed);
+    debug_assert!(previous >= amount, "queue accounting underflow");
 }
 
 fn drain_batches<R: RequestFields>(batches: &mut [LaneQueues<R>], queue: QueueKind, output: &mut VecDeque<QueuedLog<R>>) {
@@ -410,6 +413,7 @@ fn drain_batches<R: RequestFields>(batches: &mut [LaneQueues<R>], queue: QueueKi
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
@@ -433,7 +437,7 @@ mod tests {
     fn shared() -> Arc<Shared> {
         Arc::new(Shared {
             accepting: AtomicBool::new(true),
-            active_submissions: AtomicU64::new(0),
+            producers_closed: AtomicBool::new(false),
             next_ticket: AtomicU64::new(0),
             completed_ticket: AtomicU64::new(0),
             metrics: ExporterMetrics::default(),
@@ -548,6 +552,43 @@ mod tests {
         collector.drain_into(&mut reserved, &mut normal);
         let record = normal.pop_front().expect("admitted normal record");
         collector.release(record.queue, record.bytes);
+        assert_eq!(shared.metrics.normal_queue_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn concurrent_admission_never_exceeds_the_global_capacity() {
+        const THREADS: usize = 8;
+        const ATTEMPTS_PER_THREAD: usize = 1_024;
+        const CAPACITY: usize = 257;
+
+        let shared = shared();
+        let collector = LogCollector::new(CAPACITY, 1, usize::MAX, usize::MAX, Arc::clone(&shared));
+        let start = Arc::new(Barrier::new(THREADS));
+        let mut producers = Vec::with_capacity(THREADS);
+        for thread in 0..THREADS {
+            let collector = Arc::clone(&collector);
+            let start = Arc::clone(&start);
+            producers.push(std::thread::spawn(move || {
+                start.wait();
+                for attempt in 0..ATTEMPTS_PER_THREAD {
+                    let _ = collector.submit(log(&format!("{thread}-{attempt}")), false);
+                }
+            }));
+        }
+        for producer in producers {
+            producer.join().expect("producer thread");
+        }
+
+        assert_eq!(shared.next_ticket.load(Ordering::Relaxed), CAPACITY as u64);
+        assert_eq!(shared.metrics.normal_queue_depth.load(Ordering::Relaxed), CAPACITY as u64);
+
+        let mut reserved = VecDeque::new();
+        let mut normal = VecDeque::new();
+        assert_eq!(collector.drain_into(&mut reserved, &mut normal), CAPACITY);
+        for queued in normal {
+            collector.release(queued.queue, queued.bytes);
+        }
+        assert_eq!(shared.metrics.normal_queue_depth.load(Ordering::Relaxed), 0);
         assert_eq!(shared.metrics.normal_queue_bytes.load(Ordering::Relaxed), 0);
     }
 

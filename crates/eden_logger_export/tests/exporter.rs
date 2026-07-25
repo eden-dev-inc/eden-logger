@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -573,5 +575,68 @@ async fn bisects_http_invalid_payload_responses_only() {
     assert_eq!(exporter.metrics_snapshot().export_attempts, 3);
     let report = exporter.shutdown(Duration::from_secs(1)).await;
     assert!(!report.timed_out);
+    server.join().expect("collector thread");
+}
+
+#[derive(Clone)]
+struct BlockingAdmissionFields {
+    entered: Arc<AtomicBool>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Default for BlockingAdmissionFields {
+    fn default() -> Self {
+        Self {
+            entered: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new((Mutex::new(true), Condvar::new())),
+        }
+    }
+}
+
+impl RequestFields for BlockingAdmissionFields {
+    fn write_display(&self, _: &mut dyn FieldWriter) {}
+    fn write_json(&self, _: &mut dyn FieldWriter) {}
+    fn merge(&mut self, _: Self) {}
+
+    fn estimated_size_bytes(&self) -> usize {
+        self.entered.store(true, Ordering::Release);
+        let (lock, ready) = &*self.gate;
+        let mut released = lock.lock().expect("lock admission gate");
+        while !*released {
+            released = ready.wait(released).expect("wait for admission release");
+        }
+        std::mem::size_of_val(self)
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_waits_for_an_inflight_sink_callback() {
+    let (endpoint, captured, server) = collector(vec![Reply::success()]);
+    let config = ExporterConfig::new(endpoint, "checkout").with_batch_limits(1, 1024 * 1024, Duration::from_millis(10));
+    let exporter = install::<BlockingAdmissionFields>(config).expect("install exporter");
+    let entered = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let context = LogContext::new().with_request(BlockingAdmissionFields { entered: Arc::clone(&entered), gate: Arc::clone(&gate) });
+    let producer = thread::spawn(move || {
+        EdenLog::new(LogLevel::Info, "inflight admission", &context, LogAudience::Internal).emit();
+    });
+
+    wait_for(|| entered.load(Ordering::Acquire), "sink callback did not enter admission").await;
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        let (lock, ready) = &*gate;
+        *lock.lock().expect("lock admission gate") = true;
+        ready.notify_one();
+    });
+
+    let report = exporter.shutdown(Duration::from_secs(1)).await;
+    producer.join().expect("producer thread");
+    releaser.join().expect("releaser thread");
+    assert!(!report.timed_out);
+    assert_eq!(report.metrics.exported, 1);
+    assert_eq!(
+        captured_message(&captured.recv_timeout(Duration::from_secs(1)).expect("captured request")),
+        "inflight admission"
+    );
     server.join().expect("collector thread");
 }

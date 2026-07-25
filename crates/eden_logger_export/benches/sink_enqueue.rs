@@ -14,6 +14,7 @@ const THREADS: usize = 8;
 const RECORDS_PER_THREAD: usize = 20_000;
 const P99_GATE: Duration = Duration::from_micros(10);
 
+#[derive(Clone, Copy)]
 struct Measurement {
     p50: Duration,
     p99: Duration,
@@ -80,19 +81,19 @@ fn run_mode(
     exporter: &eden_logger_export::ExporterHandle<BenchFields>,
 ) {
     assert!(rounds > 0, "EDEN_EXPORT_BENCH_ROUNDS must be greater than zero");
-    let mut measurement = None;
+    let mut measurements = Vec::with_capacity(rounds);
     for _ in 0..rounds {
-        measurement = Some(measure(target, direct, profile));
+        measurements.push(measure(target, direct, profile));
         wait_for_drain(exporter);
     }
-    let measurement = measurement.expect("at least one benchmark round");
     if profile {
-        println!(
-            "eden_logger_export {name}: profile throughput={:.0} records/s ({rounds} round(s))",
-            throughput(&measurement)
-        );
+        let elapsed = measurements.iter().fold(Duration::ZERO, |total, measurement| total.saturating_add(measurement.elapsed));
+        let throughput = (THREADS * RECORDS_PER_THREAD * rounds) as f64 / elapsed.as_secs_f64();
+        println!("eden_logger_export {name}: profile throughput={:.0} records/s ({rounds} round(s))", throughput);
         return;
     }
+    measurements.sort_unstable_by_key(|measurement| measurement.p99);
+    let measurement = measurements[measurements.len() / 2];
     println!(
         "eden_logger_export {name}: p50={} ns p99={} ns throughput={:.0} records/s ({rounds} round(s))",
         measurement.p50.as_nanos(),

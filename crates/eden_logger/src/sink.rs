@@ -60,7 +60,8 @@ pub struct SinkRegistration<R: RequestFields> {
 
 impl<R: RequestFields> SinkRegistration<R> {
     /// Atomically replace the active callback without invalidating thread-local
-    /// slot caches.
+    /// slot caches. The replaced callback remains alive until dispatches that
+    /// already loaded it have returned.
     pub fn replace<F>(&mut self, sink: F) -> Result<(), &'static str>
     where
         F: Fn(EdenLog<R>) + Send + Sync + 'static,
@@ -78,6 +79,9 @@ impl<R: RequestFields> SinkRegistration<R> {
     }
 
     /// Disable this callback. Returns whether it was still the active sink.
+    ///
+    /// The callback remains alive until dispatches that already loaded it have
+    /// returned.
     pub fn disable(&mut self) -> bool {
         let Some(current) = self.callback.as_ref().cloned() else {
             return false;
@@ -200,6 +204,8 @@ fn cached_sink<R: RequestFields>() -> Option<&'static SinkSlot<R>> {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Condvar, Mutex};
 
     use crate::{FieldWriter, LogAudience, LogContext, LogLevel};
 
@@ -213,6 +219,9 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct ConcurrentFields;
+
+    #[derive(Clone, Default)]
+    struct CallbackLifetimeFields;
 
     impl RequestFields for CachedFields {
         fn write_display(&self, _: &mut dyn FieldWriter) {}
@@ -230,6 +239,20 @@ mod tests {
         fn write_display(&self, _: &mut dyn FieldWriter) {}
         fn write_json(&self, _: &mut dyn FieldWriter) {}
         fn merge(&mut self, _: Self) {}
+    }
+
+    impl RequestFields for CallbackLifetimeFields {
+        fn write_display(&self, _: &mut dyn FieldWriter) {}
+        fn write_json(&self, _: &mut dyn FieldWriter) {}
+        fn merge(&mut self, _: Self) {}
+    }
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[test]
@@ -322,5 +345,40 @@ mod tests {
         }
 
         assert_eq!(callback_calls.load(Ordering::Relaxed), THREADS * CALLS);
+    }
+
+    #[test]
+    fn replaced_callback_lives_until_inflight_dispatch_returns() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let probe = DropProbe(Arc::clone(&drops));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let sink_gate = Arc::clone(&gate);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let mut registration = register_sink::<CallbackLifetimeFields, _>(move |_| {
+            let _probe = &probe;
+            entered_tx.send(()).expect("signal callback entry");
+            let (lock, ready) = &*sink_gate;
+            let mut released = lock.lock().expect("lock callback gate");
+            while !*released {
+                released = ready.wait(released).expect("wait for callback release");
+            }
+        })
+        .expect("register callback");
+
+        let dispatch = std::thread::spawn(|| {
+            super::dispatch(|| {
+                EdenLog::new(LogLevel::Info, "inflight", &LogContext::<CallbackLifetimeFields>::new(), LogAudience::Internal)
+            });
+        });
+        entered_rx.recv().expect("callback entered");
+
+        registration.replace(|_| {}).expect("replace callback");
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        let (lock, ready) = &*gate;
+        *lock.lock().expect("lock callback gate") = true;
+        ready.notify_one();
+        dispatch.join().expect("dispatch thread");
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 }

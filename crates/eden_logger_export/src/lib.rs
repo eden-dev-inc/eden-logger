@@ -324,7 +324,7 @@ impl From<OtlpHttpError> for InstallError {
 
 pub(crate) struct Shared {
     pub accepting: AtomicBool,
-    pub active_submissions: AtomicU64,
+    pub producers_closed: AtomicBool,
     pub next_ticket: AtomicU64,
     pub completed_ticket: AtomicU64,
     pub metrics: ExporterMetrics,
@@ -358,20 +358,16 @@ impl Shared {
     }
 }
 
-struct ActiveSubmission<'a> {
-    shared: &'a Shared,
+struct ProducerFence {
+    shared: Arc<Shared>,
 }
 
-impl<'a> ActiveSubmission<'a> {
-    fn begin(shared: &'a Shared) -> Self {
-        shared.active_submissions.fetch_add(1, Ordering::AcqRel);
-        Self { shared }
-    }
-}
-
-impl Drop for ActiveSubmission<'_> {
+impl Drop for ProducerFence {
     fn drop(&mut self) {
-        decrement(&self.shared.active_submissions);
+        // Sink callbacks are reference-counted by eden_logger and remain alive
+        // until dispatches that already loaded them return. Consequently this
+        // transition is an exact, zero-hot-path-cost producer quiescence fence.
+        self.shared.producers_closed.store(true, Ordering::Release);
         self.shared.records.notify_one();
     }
 }
@@ -610,7 +606,7 @@ where
 
     let shared = Arc::new(Shared {
         accepting: AtomicBool::new(true),
-        active_submissions: AtomicU64::new(0),
+        producers_closed: AtomicBool::new(false),
         next_ticket: AtomicU64::new(0),
         completed_ticket: AtomicU64::new(0),
         metrics: ExporterMetrics::default(),
@@ -646,8 +642,9 @@ fn make_sink<R>(
 where
     R: RequestFields,
 {
+    let producer_fence = ProducerFence { shared: sink_shared };
     move |log: EdenLog<R>| {
-        let _submission = ActiveSubmission::begin(&sink_shared);
+        let sink_shared = &producer_fence.shared;
         if !sink_shared.accepting.load(Ordering::Acquire) {
             sink_shared.metrics.dropped_stopped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -746,7 +743,8 @@ pub(crate) fn set_last_error(shared: &Shared, message: String) {
 }
 
 pub(crate) fn decrement(value: &AtomicU64) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(1)));
+    let previous = value.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(previous > 0, "queue accounting underflow");
 }
 
 fn remaining_records(shared: &Shared) -> u64 {

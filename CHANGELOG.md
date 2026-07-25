@@ -27,7 +27,8 @@ Planned releases: `eden_logger` 0.1.2 and `eden_logger_export` 0.1.0.
   `serde` feature still implies `sink` for compatibility.
 - Added lifecycle-managed `register_sink`/`SinkRegistration`; callbacks can be
   atomically replaced, disabled, dropped, and reinstalled for the same request
-  type while thread-local slot caches remain valid.
+  type while thread-local slot caches remain valid. Replaced callbacks remain
+  alive until dispatches that already loaded them return.
 - Added `RequestFields::estimated_size_bytes` and
   `EdenLog::estimated_size_bytes` for retained-memory admission accounting.
 - Removed serialization bounds from `install_sink`; exporters consume typed
@@ -37,6 +38,10 @@ Planned releases: `eden_logger` 0.1.2 and `eden_logger_export` 0.1.0.
   registry lookup, serialization, protobuf encoding, waiting, and network I/O
   off the steady-state logging path without retaining stopped exporter
   generations.
+- Reused the callback lifetime as the exporter producer-quiescence fence and
+  used payload-independent relaxed queue accounting. This removes per-record
+  lifecycle atomics and wakeups without weakening bounded admission, exact
+  flush, shutdown, or reconfiguration behavior.
 - Updated the workspace MSRV to Rust 1.93 to match fast-telemetry 0.9 and its
   optional runtime dependencies.
 

@@ -119,4 +119,7 @@ sink for later reinstallation, and attempts a bounded drain. Dropping the
 handle also disables the sink and aborts the worker.
 
 The eight-thread contention benchmark is in `benches/sink_enqueue.rs`; its
-recorded before/after results are in `benches/THREAD_LOCAL_RESULTS.md`.
+recorded before/after results are in `benches/THREAD_LOCAL_RESULTS.md`. Its
+15-round direct-path comparison improved from 1.709 µs to 625 ns median p99 and
+from 9.05M to 23.62M records/s while preserving the lifecycle and memory-safety
+contract.
