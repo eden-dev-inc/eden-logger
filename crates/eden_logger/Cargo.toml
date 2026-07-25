@@ -1,6 +1,6 @@
 [package]
 name = "eden_logger"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "High-performance structured logging with compile-time tier gating."
 license = "MIT"
@@ -9,7 +9,7 @@ readme = "README.md"
 
 [dependencies]
 eden_logger_macros = { version = "0.1.0", path = "../eden_logger_macros" }
-fast-telemetry = { version = "0.7.1", optional = true }
+fast-telemetry = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -48,11 +48,12 @@ otel-context = ["dep:opentelemetry"]
 # macro skips function-name capture and `#[named]` is not required.
 function-name = ["dep:function_name", "eden_logger_macros/function-name"]
 
-# Enable serde derives on the log types, the `EdenLog::to_json` method, and
-# the optional `install_sink` registry. When off, `eden_logger` has no serde
-# dependency and consumers' `RequestFields` impls don't need `Serialize` /
-# `Deserialize` bounds.
-serde = ["dep:serde", "dep:serde_json"]
+# Enable the optional structured sink registry without requiring serialization.
+sink = []
+
+# Enable serde derives and `EdenLog::to_json`. This continues to imply `sink`
+# for compatibility with releases where `install_sink` was gated by `serde`.
+serde = ["dep:serde", "dep:serde_json", "sink"]
 
 # Production: info/warn/error only (no debug or trace)
 production = [
@@ -86,7 +87,7 @@ full = [
 [dev-dependencies]
 criterion = { workspace = true }
 env_logger = { workspace = true }
-fast-telemetry = "0.7.1"
+fast-telemetry.workspace = true
 spdlog-rs = "0.4"
 fast_log = "1.7"
 

@@ -5,6 +5,7 @@ Standalone workspace for Eden's public structured logging crates.
 ## Crates
 
 - `eden_logger`: structured logging API, context model, writers, sinks, and log macros.
+- `eden_logger_export`: bounded Tokio OTLP/HTTP export built on the typed sink API.
 - `eden_logger_macros`: proc macros used by `eden_logger`.
 
 Eden-specific wrappers, including `eden_logger_internal`, live in `eden-dev` and are not part of this public logger workspace.

@@ -14,6 +14,9 @@ pub enum LogTarget {
     Stdout = 1,
     /// Write to sink (for benchmarking, no actual I/O)
     Sink = 2,
+    /// Dispatch structured records to an installed sink without formatting a
+    /// duplicate text line.
+    StructuredSink = 3,
 }
 
 impl LogTarget {
@@ -22,6 +25,7 @@ impl LogTarget {
         match v {
             1 => LogTarget::Stdout,
             2 => LogTarget::Sink,
+            3 => LogTarget::StructuredSink,
             _ => LogTarget::Stderr,
         }
     }
@@ -112,6 +116,7 @@ pub fn log(line: &str) {
             let _ = sink.write_all(line.as_bytes());
             let _ = sink.write_all(b"\n");
         }
+        LogTarget::StructuredSink => {}
     }
 }
 
@@ -131,5 +136,6 @@ pub fn log_bytes(bytes: &[u8]) {
         LogTarget::Sink => {
             let _ = io::sink().write_all(bytes);
         }
+        LogTarget::StructuredSink => {}
     }
 }

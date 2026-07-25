@@ -1,0 +1,28 @@
+[package]
+name = "eden_logger_export"
+version = "0.1.0"
+edition = "2024"
+description = "Bounded OTLP log export for eden_logger."
+license = "MIT"
+repository = "https://github.com/eden-dev-inc/eden-logger"
+readme = "README.md"
+
+[dependencies]
+eden_logger = { version = "0.1.2", path = "../eden_logger", default-features = false, features = ["sink"] }
+fast-telemetry = { workspace = true, features = ["otlp-logs"] }
+fast-telemetry-export = { workspace = true, features = ["otlp-logs"] }
+parking_lot.workspace = true
+prost.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+eden_logger = { version = "0.1.2", path = "../eden_logger", default-features = false, features = ["sink", "log-info", "log-warn", "log-error", "log-internal"] }
+flate2 = "1"
+hegeltest.workspace = true
+
+[[bench]]
+name = "sink_enqueue"
+harness = false
+
+[lints]
+workspace = true
