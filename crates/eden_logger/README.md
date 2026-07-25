@@ -37,6 +37,19 @@ init(WriterConfig {
 });
 ```
 
+When an installed structured sink is the only destination, use
+`LogTarget::StructuredSink`. This bypasses duplicate text formatting while
+still dispatching the typed `EdenLog<R>` record:
+
+```rust
+use eden_logger::{LogFormat, LogTarget, WriterConfig, init};
+init(WriterConfig {
+    target: LogTarget::StructuredSink,
+    format: LogFormat::Json,
+    ..Default::default()
+});
+```
+
 ```json
 {"ts":"2026-05-26T18:04:21.130Z","level":"INFO","audience":"INTERNAL","feature":"auth","fn":"login","msg":"Server started"}
 ```
@@ -58,7 +71,8 @@ Every log has both a **level** (`trace`/`debug`/`info`/`warn`/`error`) and an **
 | `source-location` | Include `file!()` / `line!()` in output        |
 | `fast-telemetry-context` | Read trace/span IDs from `fast-telemetry` and expose grouped log counters |
 | `function-name`   | `ctx_with_trace!()` captures the enclosing function name (requires `#[function_name::named]` on the calling function; see [Trace context](#trace-context)) |
-| `serde`           | Enable serde derives on the log types, `EdenLog::to_json`, and the optional `install_sink` registry. Off by default. When off, `RequestFields` impls don't need `Serialize`/`Deserialize` bounds. |
+| `sink`            | Enable the optional typed `install_sink` registry without enabling serialization. |
+| `serde`           | Enable serde derives and `EdenLog::to_json`; also implies `sink` for compatibility. |
 
 A log macro call requires **both** the matching level feature and the matching audience feature. If either is off, the macro expands to `{}`: no code, no string literal in the binary. Build a release that physically cannot emit client-facing logs by leaving `log-client` off.
 
@@ -236,7 +250,15 @@ install_sink::<(), _>(|log: EdenLog<()>| {
 }).expect("sink already installed");
 ```
 
-Sinks are keyed by the `RequestFields` type, so different `R` instantiations have independent slots.
+Sinks are keyed by the `RequestFields` type, so different `R` instantiations
+have independent slots. Each thread caches a stable typed slot after its first
+lookup, avoiding the global registry lock on steady-state dispatch. The
+compatibility `install_sink` API remains installed for the process lifetime;
+use `register_sink` when an integration must atomically replace or later
+disable its callback.
+Use the companion `eden_logger_export` crate for a bounded Tokio OTLP/HTTP
+worker, or install a shard-stream bridge when delivery needs HA spooling and
+ordered replay.
 
 ## Performance
 

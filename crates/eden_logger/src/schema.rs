@@ -162,6 +162,38 @@ impl<R: RequestFields> EdenLog<R> {
         self
     }
 
+    /// Estimate bytes retained while this owned record is queued.
+    ///
+    /// This is deliberately cheaper than serialization and is used only for
+    /// bounded sink admission. Custom request fields should provide an
+    /// accurate [`RequestFields::estimated_size_bytes`] implementation.
+    pub fn estimated_size_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of_val(self)
+            .saturating_sub(std::mem::size_of_val(&self.request))
+            .saturating_add(self.message.capacity())
+            .saturating_add(self.request.estimated_size_bytes());
+        for value in [
+            self.trace_id.as_deref(),
+            self.span_id.as_deref(),
+            self.feature.as_deref(),
+            self.function.as_deref(),
+            self.file.as_deref(),
+            self.error_code.as_deref(),
+            self.error_category.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = bytes.saturating_add(value.len());
+        }
+        bytes =
+            bytes.saturating_add(self.additional.capacity().saturating_mul(std::mem::size_of::<(SmolStr, SmolStr)>().saturating_add(1)));
+        for (key, value) in &self.additional {
+            bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+        }
+        bytes
+    }
+
     pub fn from_direct(
         level: LogLevel,
         message: &str,
@@ -288,19 +320,21 @@ impl<R: RequestFields> EdenLog<R> {
         #[cfg(feature = "fast-telemetry-context")]
         crate::metrics::record_emitted(self.level, self.audience);
 
-        thread_local! {
-            static FMT_BUF: RefCell<String> = RefCell::new(String::with_capacity(1024));
+        if crate::writer::target() != crate::writer::LogTarget::StructuredSink {
+            thread_local! {
+                static FMT_BUF: RefCell<String> = RefCell::new(String::with_capacity(1024));
+            }
+
+            FMT_BUF.with(|buf| {
+                let mut buf = buf.borrow_mut();
+                buf.clear();
+                self.write_display(&mut buf);
+                buf.push('\n');
+                crate::writer::log_bytes(buf.as_bytes());
+            });
         }
 
-        FMT_BUF.with(|buf| {
-            let mut buf = buf.borrow_mut();
-            buf.clear();
-            self.write_display(&mut buf);
-            buf.push('\n');
-            crate::writer::log_bytes(buf.as_bytes());
-        });
-
-        #[cfg(feature = "serde")]
+        #[cfg(feature = "sink")]
         {
             crate::sink::dispatch::<R>(|| self.clone());
         }
@@ -334,31 +368,31 @@ pub fn emit_direct<R: RequestFields>(
     #[cfg(feature = "fast-telemetry-context")]
     crate::metrics::record_emitted(level, audience);
 
-    thread_local! {
-        static FMT_BUF: RefCell<String> = RefCell::new(String::with_capacity(1024));
-    }
-
-    FMT_BUF.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        buf.clear();
-
-        match crate::writer::format() {
-            crate::writer::LogFormat::Json => {
-                write_json_direct(&mut buf, level, message, context, audience, additional, file, line);
-            }
-            crate::writer::LogFormat::Display => {
-                write_display_direct(&mut buf, level, message, context, audience, additional, file, line);
-            }
+    if crate::writer::target() != crate::writer::LogTarget::StructuredSink {
+        thread_local! {
+            static FMT_BUF: RefCell<String> = RefCell::new(String::with_capacity(1024));
         }
 
-        buf.push('\n');
-        crate::writer::log_bytes(buf.as_bytes());
-    });
+        FMT_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
 
-    // Sink dispatch is gated on the `serde` feature: storing/forwarding an
-    // `EdenLog<R>` value requires `R: Serialize` in practice (typical sinks
-    // forward to a serializer), so the whole sink subsystem rides on it.
-    #[cfg(feature = "serde")]
+            match crate::writer::format() {
+                crate::writer::LogFormat::Json => {
+                    write_json_direct(&mut buf, level, message, context, audience, additional, file, line);
+                }
+                crate::writer::LogFormat::Display => {
+                    write_display_direct(&mut buf, level, message, context, audience, additional, file, line);
+                }
+            }
+
+            buf.push('\n');
+            crate::writer::log_bytes(buf.as_bytes());
+        });
+    }
+
+    // Sink dispatch is optional and independent of any serialization format.
+    #[cfg(feature = "sink")]
     {
         crate::sink::dispatch::<R>(|| EdenLog::from_direct(level, message, context, audience, additional, file, line));
     }

@@ -2,6 +2,7 @@
 name = "eden_logger_macros"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 description = "Proc macros for eden_logger compile-time logging gates."
 license = "MIT"
 repository = "https://github.com/eden-dev-inc/eden-logger"
